@@ -38,10 +38,26 @@ def default_config() -> config_dict.ConfigDict:
 class AirbotPlayPick(airbot_play.AirbotPlayBase):
     def __init__(
         self,
-        xml_path: epath.Path,
-        config: config_dict.ConfigDict,
+        xml_path: Optional[epath.Path] = None,
+        config: config_dict.ConfigDict = default_config(),
         config_overrides: Optional[Dict[str, Union[str, int, list[Any]]]] = None,
     ):
+        xml_path = xml_path or (
+            mjx_env.ROOT_PATH
+            / "manipulation"
+            / "airbot_play"
+            / "xmls"
+            / "airbot_play.xml"
+        )
+
+        xml_path = epath.Path(xml_path)
+        if not xml_path.exists():
+            raise FileNotFoundError(
+                "Airbot Play model file not found. "
+                "Place the Airbot Play MJX XML at "
+                f"'{xml_path}' or pass an explicit xml_path to AirbotPlayPick."
+            )
+
         super().__init__(xml_path, config, config_overrides)
         self._post_init(keyframe="home")
 

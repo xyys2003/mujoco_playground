@@ -98,7 +98,7 @@ from mujoco_playground import registry
 from mujoco_playground._src.wrapper_torch import RSLRLBraxWrapper
 # ===== Environment setup =====
 
-env_name = 'PandaPickCubeOrientation'
+env_name = 'AirbotPlayPick'
 env = registry.load(env_name)                     # MjxEnv (JAX)
 env_cfg = registry.get_default_config(env_name)   # contains episode_length, action_repeat, etc.
 
@@ -147,7 +147,7 @@ class Args:
     checkpoint: Optional[str] = None
 
     # Algorithm specific arguments
-    env_id: str = "PandaPickCubeOrientation"  # 仅用于命名，不用来 gym.make
+    env_id: str = "AirbotPlayPick"  # 仅用于命名，不用来 gym.make
     total_timesteps: int = 1000000
     learning_rate: float = 3e-4
     num_envs: int = 64
