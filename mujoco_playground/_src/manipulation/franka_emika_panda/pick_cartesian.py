@@ -142,6 +142,7 @@ class PandaPickCubeCartesian(pick.PandaPickCube):
             'Madrona MJX not installed. Cannot use vision with'
             ' PandaPickCubeCartesian.'
         )
+        self._vision = False
         return
       self.renderer = BatchRenderer(
           m=self._mjx_model,
