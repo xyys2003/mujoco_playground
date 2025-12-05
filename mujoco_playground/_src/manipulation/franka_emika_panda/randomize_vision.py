@@ -24,9 +24,7 @@ import numpy as np
 from mujoco_playground._src.manipulation.franka_emika_panda import pick_cartesian
 
 
-def sample_light_position(key: jax.Arraykey: jax.Array):
-  """Samples a light position using a deterministic numpy RNG seed."""
-  rng = np.random.default_rng(int(jax.random.bits(key, 63)))
+def sample_light_position(key: jax.Array):
   """Samples a light position using a deterministic numpy RNG seed."""
   # Ensure we convert a scalar array to a Python integer for seeding numpy.
   seed = int(jax.random.bits(key, shape=(), dtype=jp.uint64).item())

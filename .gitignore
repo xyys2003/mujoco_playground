@@ -6,3 +6,4 @@ MUJOCO_LOG.TXT
 mujoco_menagerie
 checkpoints/
 logs
+runs/

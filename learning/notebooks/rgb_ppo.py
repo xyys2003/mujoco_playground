@@ -478,6 +478,28 @@ def main():
 
     renderer = RolloutVideoRenderer(train_env, env_cfg, args)
 
+    if args.evaluate:
+        agent.eval()
+        with torch.no_grad():
+            eval_obs, eval_info = eval_envs.reset(seed=args.seed + 1234)
+            eval_obs = preprocess_obs(eval_obs.to(device), envs)
+            eval_critic_obs = eval_info["critic_obs"].to(device)
+            eval_returns = torch.zeros(args.num_eval_steps, device=device)
+            for eval_step in range(args.num_eval_steps):
+                eval_action = agent.get_action(eval_obs, deterministic=True)
+                eval_obs, eval_reward, eval_done, eval_trunc, eval_info = eval_envs.step(
+                    clip_action(eval_action)
+                )
+                eval_obs = preprocess_obs(eval_obs.to(device), envs)
+                eval_critic_obs = eval_info["critic_obs"].to(device)
+                eval_returns[eval_step] = eval_reward.mean()
+                if eval_done.sum() + eval_trunc.sum() > 0:
+                    break
+            mean_return = eval_returns[: eval_step + 1].mean().item()
+            print(f"Eval return: {mean_return}")
+        renderer.render(agent, device)
+        return
+
     for iteration in range(1, args.num_iterations + 1):
         final_values = torch.zeros((args.num_steps, train_num_envs), device=device)
         agent.eval()

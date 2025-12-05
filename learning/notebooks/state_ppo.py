@@ -287,7 +287,6 @@ class PlaygroundPPOEnv:
         return obs, reward, terminations, truncations, infos
 
     def close(self):
-        # 如有需要，你可以在 RSLRLBraxWrapper 里加资源释放接口，然后这里调用
         pass
 
 

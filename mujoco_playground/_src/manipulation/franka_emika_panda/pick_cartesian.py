@@ -234,6 +234,7 @@ class PandaPickCubeCartesian(pick.PandaPickCube):
         },
         'reward/success': jp.array(0.0),
         'reward/lifted': jp.array(0.0),
+        'success': jp.array(0.0),
     }
 
     info = {
