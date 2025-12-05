@@ -543,6 +543,14 @@ def main():
                                     eval_success_values = torch.as_tensor(v, device=device)
                                 except Exception:
                                     eval_success_values = None
+                        elif k == "reward/success":
+                            if isinstance(v, torch.Tensor):
+                                eval_success_values = (v > 0).to(device)
+                            else:
+                                try:
+                                    eval_success_values = torch.as_tensor(v, device=device) > 0
+                                except Exception:
+                                    eval_success_values = None
 
                     eval_next_done = torch.logical_or(eval_terms.bool(), eval_truncs.bool())
                     if args.success_once:
@@ -619,6 +627,14 @@ def main():
                     else:
                         try:
                             success_values = torch.as_tensor(v, device=device)
+                        except Exception:
+                            success_values = None
+                elif k == "reward/success":
+                    if isinstance(v, torch.Tensor):
+                        success_values = (v > 0).to(device)
+                    else:
+                        try:
+                            success_values = torch.as_tensor(v, device=device) > 0
                         except Exception:
                             success_values = None
 
