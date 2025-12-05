@@ -17,7 +17,8 @@ _ARM_JOINTS = [
     "joint5",
     "joint6",
 ]
-_FINGER_JOINTS = ["right", "left"]
+# Joint names must match the Airbot Play XML definition.
+_FINGER_JOINTS = ["endleft", "endright"]
 
 
 def default_config() -> config_dict.ConfigDict:
