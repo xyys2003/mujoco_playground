@@ -139,6 +139,9 @@ class Args:
     wandb_entity: Optional[str] = None
 
     capture_video: bool = False    # 视频这边先关掉，后面你可以加
+    video_path: Optional[str] = None
+    video_num_steps: int = 200
+    video_render_every: int = 1
     save_model: bool = True
     evaluate: bool = False
     checkpoint: Optional[str] = None
@@ -168,6 +171,7 @@ class Args:
     reward_scale: float = 1.0
     eval_freq: int = 25
     finite_horizon_gae: bool = False
+    success_once: bool = True
 
     # runtime filled
     batch_size: int = 0
@@ -185,10 +189,13 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 class PlaygroundPPOEnv:
     """
-    Adapt MuJoCo Playground + RSLRLBraxWrapper to the ManiSkill PPO-style env interface:
-      - reset(seed) -> (obs, info)
-      - step(action) -> (obs, reward, terminations, truncations, infos)
-      - attributes: single_observation_space, single_action_space, num_envs
+    Adapt MuJoCo Playground + RSLRLBraxWrapper to the ManiSkill PPO-style env
+    interface.
+
+    The wrapper flattens TensorDict observations into vanilla torch tensors so
+    that the rest of this script can stay close to the ManiSkill PPO reference
+    implementation. It also exposes privileged observations (if available) via
+    ``info["critic_obs"]``.
     """
 
     def __init__(self, vec_env: RSLRLBraxWrapper):
@@ -196,12 +203,21 @@ class PlaygroundPPOEnv:
         self.num_envs = vec_env.num_envs
 
         obs_dim = vec_env.num_obs
+        self.critic_obs_dim = vec_env.num_privileged_obs
         act_dim = vec_env.num_actions
 
         self.single_observation_space = gym.spaces.Box(
             low=-np.inf,
             high=np.inf,
             shape=(obs_dim,),
+            dtype=np.float32,
+        )
+
+        critic_dim = self.critic_obs_dim or obs_dim
+        self.single_critic_observation_space = gym.spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(critic_dim,),
             dtype=np.float32,
         )
 
@@ -213,16 +229,61 @@ class PlaygroundPPOEnv:
             dtype=np.float32,
         )
 
+    def _split_obs(self, obs_td):
+        """Return actor and critic observations from a TensorDict-like object.
+
+        Some environments may return plain tensors instead of TensorDicts when
+        asymmetric (privileged) observations are disabled. Be permissive here
+        so we can gracefully handle both cases.
+        """
+
+        def _maybe_tensor(x):
+            if isinstance(x, torch.Tensor):
+                return x
+            return torch.as_tensor(x)
+
+        if hasattr(obs_td, "get"):
+            obs = obs_td.get("state", None)
+            critic_obs = obs_td.get("privileged_state", None)
+        else:
+            obs = None
+            critic_obs = None
+
+        if obs is None:
+            try:
+                obs = obs_td["state"]
+            except Exception:
+                obs = obs_td
+
+        if critic_obs is None:
+            try:
+                critic_obs = obs_td["privileged_state"]
+            except Exception:
+                critic_obs = None
+
+        obs = _maybe_tensor(obs).float()
+        critic_obs = _maybe_tensor(critic_obs).float() if critic_obs is not None else obs
+        return obs, critic_obs
+
     def reset(self, seed: Optional[int] = None):
-        obs = self._env.reset()   
-        info = {}
+        if seed is not None:
+            # Currently unused, present for API parity.
+            _ = seed
+        obs_td = self._env.reset()
+        obs, critic_obs = self._split_obs(obs_td)
+        info = {"critic_obs": critic_obs}
         return obs, info
 
     def step(self, action: torch.Tensor):
-        obs, reward, done, info = self._env.step(action)
-        terminations = done
-        truncations = torch.zeros_like(done)
-        infos = {}  # 简化: 不提供 ManiSkill 那种 final_info 结构
+        obs_td, reward, done, info = self._env.step(action)
+        obs, critic_obs = self._split_obs(obs_td)
+        time_outs = info.get("time_outs", torch.zeros_like(done))
+        terminations = torch.logical_and(done.bool(), ~time_outs.bool()).float()
+        truncations = time_outs.float()
+        infos = {
+            "critic_obs": critic_obs,
+            "log": info.get("log", {}),
+        }
         return obs, reward, terminations, truncations, infos
 
     def close(self):
@@ -245,6 +306,38 @@ def make_playground_vec_env(num_envs: int, seed: int) -> PlaygroundPPOEnv:
     ppo_env = PlaygroundPPOEnv(vec_env)
     return ppo_env
 
+ 
+ 
+def record_policy_video(agent: nn.Module, args: Args, device: torch.device):
+    if not args.capture_video or args.video_path is None:
+        return
+
+    # Follow manipulation.ipynb: roll out with the current policy and render frames.
+    jit_reset = jax.jit(env.reset)
+    jit_step = jax.jit(env.step)
+
+    rng = jax.random.PRNGKey(args.seed + 2025)
+    state = jit_reset(rng)
+    rollout = [state]
+
+    max_steps = min(args.video_num_steps, env_cfg.episode_length)
+    render_every = max(1, args.video_render_every)
+
+    agent.eval()
+    for _ in range(max_steps):
+        obs = state.obs["state"] if isinstance(state.obs, dict) else state.obs
+        obs_tensor = torch.from_numpy(np.array(obs)).to(device).float().unsqueeze(0)
+        with torch.no_grad():
+            action = agent.get_action(obs_tensor, deterministic=True).cpu().numpy()[0]
+        state = jit_step(state, action)
+        rollout.append(state)
+
+    frames = env.render(rollout[::render_every])
+    fps = 1.0 / env.dt / render_every if hasattr(env, "dt") else 30
+
+    os.makedirs(os.path.dirname(args.video_path) or ".", exist_ok=True)
+    media.write_video(args.video_path, frames, fps=fps)
+    print(f"Saved evaluation video to {args.video_path}")
 
 
 # ---------- PPO Agent ----------
@@ -253,10 +346,11 @@ class Agent(nn.Module):
     def __init__(self, envs: PlaygroundPPOEnv):
         super().__init__()
         obs_dim = int(np.prod(envs.single_observation_space.shape))
+        critic_obs_dim = int(np.prod(envs.single_critic_observation_space.shape))
         act_dim = int(np.prod(envs.single_action_space.shape))
 
         self.critic = nn.Sequential(
-            layer_init(nn.Linear(obs_dim, 256)),
+            layer_init(nn.Linear(critic_obs_dim, 256)),
             nn.Tanh(),
             layer_init(nn.Linear(256, 256)),
             nn.Tanh(),
@@ -276,11 +370,12 @@ class Agent(nn.Module):
         # logstd 初始为 -0.5 (跟 ManiSkill 脚本一致)
         self.actor_logstd = nn.Parameter(torch.ones(1, act_dim) * -0.5)
 
-    def get_value(self, x):
-        return self.critic(x)
+    def get_value(self, obs, critic_obs=None):
+        critic_input = critic_obs if critic_obs is not None else obs
+        return self.critic(critic_input)
 
-    def get_action(self, x, deterministic: bool = False):
-        action_mean = self.actor_mean(x)
+    def get_action(self, obs, deterministic: bool = False):
+        action_mean = self.actor_mean(obs)
         if deterministic:
             return action_mean
         action_logstd = self.actor_logstd.expand_as(action_mean)
@@ -288,8 +383,8 @@ class Agent(nn.Module):
         probs = Normal(action_mean, action_std)
         return probs.sample()
 
-    def get_action_and_value(self, x, action=None):
-        action_mean = self.actor_mean(x)
+    def get_action_and_value(self, obs, critic_obs=None, action=None):
+        action_mean = self.actor_mean(obs)
         action_logstd = self.actor_logstd.expand_as(action_mean)
         action_std = torch.exp(action_logstd)
         probs = Normal(action_mean, action_std)
@@ -297,7 +392,7 @@ class Agent(nn.Module):
             action = probs.sample()
         log_prob = probs.log_prob(action).sum(1)
         entropy = probs.entropy().sum(1)
-        value = self.critic(x)
+        value = self.get_value(obs, critic_obs)
         return action, log_prob, entropy, value
 
 
@@ -370,6 +465,11 @@ def main():
         (args.num_steps, train_num_envs) + envs.single_observation_space.shape,
         device=device,
     )
+    critic_obs_buf = torch.zeros(
+        (args.num_steps, train_num_envs)
+        + envs.single_critic_observation_space.shape,
+        device=device,
+    )
     actions_buf = torch.zeros(
         (args.num_steps, train_num_envs) + envs.single_action_space.shape,
         device=device,
@@ -382,12 +482,16 @@ def main():
     global_step = 0
     start_time = time.time()
 
-    next_obs, _ = envs.reset(seed=args.seed)
+    next_obs, info = envs.reset(seed=args.seed)
     next_obs = next_obs.to(device)
-    eval_obs, _ = eval_envs.reset(seed=args.seed + 123)
+    next_critic_obs = info["critic_obs"].to(device)
+
+    eval_obs, eval_info = eval_envs.reset(seed=args.seed + 123)
     eval_obs = eval_obs.to(device)
+    eval_critic_obs = eval_info["critic_obs"].to(device)
 
     next_done = torch.zeros(train_num_envs, device=device)
+    success_once_tracker = torch.zeros(train_num_envs, device=device, dtype=torch.bool)
 
     print("####")
     print(f"num_iterations={args.num_iterations}, num_envs={train_num_envs}, num_eval_envs={eval_num_envs}")
@@ -407,27 +511,55 @@ def main():
         print(f"Iteration: {iteration}, global_step={global_step}")
         final_values = torch.zeros((args.num_steps, train_num_envs), device=device)
         agent.eval()
+        rollout_logs: dict[str, list[float]] = defaultdict(list)
 
         # Evaluation
         if iteration % args.eval_freq == 1:
             print("Evaluating...")
-            eval_obs, _ = eval_envs.reset(seed=args.seed + 1234)
+            eval_obs, eval_info = eval_envs.reset(seed=args.seed + 1234)
             eval_obs = eval_obs.to(device)
+            eval_critic_obs = eval_info["critic_obs"].to(device)
             eval_returns = []
+            eval_success_once = torch.zeros(eval_num_envs, device=device, dtype=torch.bool)
+            eval_success_rates: list[float] = []
 
             with torch.no_grad():
                 for _ in range(args.num_eval_steps):
                     actions_eval = agent.get_action(eval_obs, deterministic=True)
                     actions_eval = clip_action(actions_eval)
-                    eval_obs, eval_rew, eval_terms, eval_truncs, _ = eval_envs.step(actions_eval)
+                    eval_obs, eval_rew, eval_terms, eval_truncs, eval_infos = eval_envs.step(actions_eval)
                     eval_obs = eval_obs.to(device)
+                    eval_critic_obs = eval_infos["critic_obs"].to(device)
                     eval_rew = eval_rew.to(device)
                     eval_returns.append(eval_rew.mean().item())
 
+                    eval_success_values = None
+                    for k, v in eval_infos.get("log", {}).items():
+                        if k in ("success", "is_success"):
+                            if isinstance(v, torch.Tensor):
+                                eval_success_values = v.to(device)
+                            else:
+                                try:
+                                    eval_success_values = torch.as_tensor(v, device=device)
+                                except Exception:
+                                    eval_success_values = None
+
+                    eval_next_done = torch.logical_or(eval_terms.bool(), eval_truncs.bool())
+                    if args.success_once:
+                        if eval_success_values is not None:
+                            eval_success_once |= eval_success_values.bool().view(-1)
+                        if eval_next_done.any():
+                            ended = eval_next_done.bool()
+                            eval_success_rates.append(eval_success_once[ended].float().mean().item())
+                            eval_success_once[ended] = False
+
             mean_return = float(np.mean(eval_returns)) if eval_returns else 0.0
+            mean_success_once = float(np.mean(eval_success_rates)) if eval_success_rates else 0.0
             print(f"Eval mean reward: {mean_return:.3f}")
             if logger is not None:
                 logger.add_scalar("eval/episode_reward", mean_return, global_step)
+                if eval_success_rates:
+                    logger.add_scalar("eval/success_once", mean_success_once, global_step)
 
             if args.evaluate:
                 break
@@ -449,10 +581,13 @@ def main():
         for step in range(args.num_steps):
             global_step += train_num_envs
             obs_buf[step] = next_obs
+            critic_obs_buf[step] = next_critic_obs
             dones_buf[step] = next_done
 
             with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(next_obs)
+                action, logprob, _, value = agent.get_action_and_value(
+                    next_obs, critic_obs=next_critic_obs
+                )
                 values_buf[step] = value.flatten()
 
             actions_buf[step] = action
@@ -460,6 +595,7 @@ def main():
 
             next_obs, reward, terminations, truncations, infos = envs.step(clip_action(action))
             next_obs = next_obs.to(device)
+            next_critic_obs = infos["critic_obs"].to(device)
             reward = reward.to(device)
             terminations = terminations.to(device)
             truncations = truncations.to(device)
@@ -467,14 +603,50 @@ def main():
             next_done = torch.logical_or(terminations.bool(), truncations.bool()).to(torch.float32)
             rewards_buf[step] = reward.view(-1) * args.reward_scale
 
-            # 如果你以后想做 bootstrap_at_done，可以仿 ManiSkill 的 final_info 逻辑；
-            # 当前我们先不处理 infos，保持简单。
+            success_values = None
+            for k, v in infos.get("log", {}).items():
+                if isinstance(v, torch.Tensor):
+                    rollout_logs[k].append(v.float().mean().item())
+                else:
+                    try:
+                        rollout_logs[k].append(float(v))
+                    except TypeError:
+                        continue
+
+                if k in ("success", "is_success"):
+                    if isinstance(v, torch.Tensor):
+                        success_values = v.to(device)
+                    else:
+                        try:
+                            success_values = torch.as_tensor(v, device=device)
+                        except Exception:
+                            success_values = None
+
+            if args.success_once:
+                if success_values is not None:
+                    success_once_tracker |= success_values.bool().view(-1)
+                if next_done.any():
+                    ended = next_done.bool()
+                    rollout_logs["success_once"].append(
+                        success_once_tracker[ended].float().mean().item()
+                    )
+                    success_once_tracker[ended] = False
+
+            if truncations.any():
+                with torch.no_grad():
+                    timeout_values = agent.get_value(
+                        next_obs, critic_obs=next_critic_obs
+                    ).flatten()
+                    final_values[step] = final_values[step].masked_scatter(
+                        truncations.bool(), timeout_values[truncations.bool()]
+                    )
+
 
         rollout_time = time.time() - rollout_time
 
         # -------- GAE & returns --------
         with torch.no_grad():
-            next_value = agent.get_value(next_obs).reshape(1, -1)
+            next_value = agent.get_value(next_obs, critic_obs=next_critic_obs).reshape(1, -1)
             advantages = torch.zeros_like(rewards_buf, device=device)
             lastgaelam = 0
 
@@ -512,6 +684,9 @@ def main():
 
         # flatten batch
         b_obs = obs_buf.reshape((-1,) + envs.single_observation_space.shape)
+        b_critic_obs = critic_obs_buf.reshape(
+            (-1,) + envs.single_critic_observation_space.shape
+        )
         b_logprobs = logprobs_buf.reshape(-1)
         b_actions = actions_buf.reshape((-1,) + envs.single_action_space.shape)
         b_advantages = advantages.reshape(-1)
@@ -531,7 +706,9 @@ def main():
                 mb_inds = b_inds[start:end]
 
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(
-                    b_obs[mb_inds], b_actions[mb_inds]
+                    b_obs[mb_inds],
+                    critic_obs=b_critic_obs[mb_inds],
+                    action=b_actions[mb_inds],
                 )
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
@@ -601,8 +778,14 @@ def main():
             logger.add_scalar("time/update_time", update_time, global_step)
             logger.add_scalar("time/rollout_time", rollout_time, global_step)
             logger.add_scalar("time/rollout_fps", args.num_envs * args.num_steps / rollout_time, global_step)
+            for log_key, values in rollout_logs.items():
+                if values:
+                    logger.add_scalar(f"env/{log_key}", float(np.mean(values)), global_step)
 
     # end main training loop
+
+    if args.capture_video and args.video_path is not None:
+        record_policy_video(agent, args, device)
 
     if not args.evaluate and args.save_model:
         final_model_path = f"runs/{run_name}/final_ckpt.pt"
