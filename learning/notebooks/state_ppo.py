@@ -369,23 +369,44 @@ class Agent(nn.Module):
         # logstd 初始为 -0.5 (跟 ManiSkill 脚本一致)
         self.actor_logstd = nn.Parameter(torch.ones(1, act_dim) * -0.5)
 
+    @staticmethod
+    def _sanitize_input(tensor: torch.Tensor, name: str) -> torch.Tensor:
+        """Replace non-finite values to keep policy outputs stable."""
+
+        if torch.isfinite(tensor).all():
+            return tensor
+
+        print(f"[Agent] Replaced non-finite values in {name} with zeros")
+        return torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
+
     def get_value(self, obs, critic_obs=None):
         critic_input = critic_obs if critic_obs is not None else obs
+        critic_input = self._sanitize_input(critic_input, "critic_obs")
         return self.critic(critic_input)
 
     def get_action(self, obs, deterministic: bool = False):
+        obs = self._sanitize_input(obs, "obs")
         action_mean = self.actor_mean(obs)
+        action_mean = self._sanitize_input(action_mean, "action_mean")
         if deterministic:
             return action_mean
         action_logstd = self.actor_logstd.expand_as(action_mean)
+        action_logstd = self._sanitize_input(action_logstd, "action_logstd")
         action_std = torch.exp(action_logstd)
+        action_std = self._sanitize_input(action_std, "action_std")
+        action_std = torch.clamp(action_std, min=1e-6)
         probs = Normal(action_mean, action_std)
         return probs.sample()
 
     def get_action_and_value(self, obs, critic_obs=None, action=None):
+        obs = self._sanitize_input(obs, "obs")
         action_mean = self.actor_mean(obs)
+        action_mean = self._sanitize_input(action_mean, "action_mean")
         action_logstd = self.actor_logstd.expand_as(action_mean)
+        action_logstd = self._sanitize_input(action_logstd, "action_logstd")
         action_std = torch.exp(action_logstd)
+        action_std = self._sanitize_input(action_std, "action_std")
+        action_std = torch.clamp(action_std, min=1e-6)
         probs = Normal(action_mean, action_std)
         if action is None:
             action = probs.sample()

@@ -1,5 +1,7 @@
 from mujoco_playground import registry
+import os 
 
+os.environ["JAX_COMPILATION_CACHE_DIR"] = "/data/yufei/jax_cache"
 # Reuse all PPO plumbing from the state-based script.
 import state_ppo as _ppo
 
