@@ -17,11 +17,12 @@ Original notebook: MuJoCo Playground manipulation example.
 # @title Check if MuJoCo installation was successful
 
 import os
-import subprocess
-
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("__EGL_EXTERNAL_PLATFORM_CONFIG_DIR",
                       "/data/yufei/egl_external_platform.d")
+import subprocess
+
+
 
 if subprocess.run('nvidia-smi').returncode:
     raise RuntimeError(
@@ -66,6 +67,8 @@ except Exception as e:
 
 print('MuJoCo installation successful.')
 
+
+
 # Tell XLA to use Triton GEMM, this improves steps/sec by ~30% on some GPUs
 xla_flags = os.environ.get('XLA_FLAGS', '')
 xla_flags += ' --xla_gpu_triton_gemm_any=True'
@@ -98,7 +101,7 @@ from mujoco_playground import registry
 from mujoco_playground._src.wrapper_torch import RSLRLBraxWrapper
 # ===== Environment setup =====
 
-env_name = 'AirbotPlayPick'
+env_name = 'AirbotPlayPickCube'
 env = registry.load(env_name)                     # MjxEnv (JAX)
 env_cfg = registry.get_default_config(env_name)   # contains episode_length, action_repeat, etc.
 
@@ -147,7 +150,7 @@ class Args:
     checkpoint: Optional[str] = None
 
     # Algorithm specific arguments
-    env_id: str = "AirbotPlayPick"  # 仅用于命名，不用来 gym.make
+    env_id: str = "AirbotPlayPickCube"  # 仅用于命名，不用来 gym.make
     total_timesteps: int = 1000000
     learning_rate: float = 3e-4
     num_envs: int = 64

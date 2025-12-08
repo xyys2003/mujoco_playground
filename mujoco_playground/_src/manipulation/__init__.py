@@ -22,7 +22,6 @@ from mujoco import mjx
 from mujoco_playground._src import mjx_env
 from mujoco_playground._src.manipulation.aloha import handover as aloha_handover
 from mujoco_playground._src.manipulation.aloha import single_peg_insertion as aloha_peg
-from mujoco_playground._src.manipulation.airbot_play import pick as airbot_play_pick
 from mujoco_playground._src.manipulation.franka_emika_panda import open_cabinet as panda_open_cabinet
 from mujoco_playground._src.manipulation.franka_emika_panda import pick as panda_pick
 from mujoco_playground._src.manipulation.franka_emika_panda import pick_cartesian as panda_pick_cartesian
@@ -30,11 +29,11 @@ from mujoco_playground._src.manipulation.franka_emika_panda_robotiq import push_
 from mujoco_playground._src.manipulation.leap_hand import reorient as leap_cube_reorient
 from mujoco_playground._src.manipulation.leap_hand import rotate_z as leap_rotate_z
 from mujoco_playground._src.manipulation.aero_hand import rotate_z as aero_hand_rotate_z
+from mujoco_playground._src.manipulation.airbot_play import pick as airbot_pick
 
 _envs = {
     "AlohaHandOver": aloha_handover.HandOver,
     "AlohaSinglePegInsertion": aloha_peg.SinglePegInsertion,
-    "AirbotPlayPick": airbot_play_pick.AirbotPlayPick,
     "PandaPickCube": panda_pick.PandaPickCube,
     "PandaPickCubeOrientation": panda_pick.PandaPickCubeOrientation,
     "PandaPickCubeCartesian": panda_pick_cartesian.PandaPickCubeCartesian,
@@ -43,12 +42,12 @@ _envs = {
     "LeapCubeReorient": leap_cube_reorient.CubeReorient,
     "LeapCubeRotateZAxis": leap_rotate_z.CubeRotateZAxis,
     "AeroCubeRotateZAxis": aero_hand_rotate_z.CubeRotateZAxis,
+    "AirbotPlayPickCube": airbot_pick.AirbotPlayPickCube,
 }
 
 _cfgs = {
     "AlohaHandOver": aloha_handover.default_config,
     "AlohaSinglePegInsertion": aloha_peg.default_config,
-    "AirbotPlayPick": airbot_play_pick.default_config,
     "PandaPickCube": panda_pick.default_config,
     "PandaPickCubeOrientation": panda_pick.default_config,
     "PandaPickCubeCartesian": panda_pick_cartesian.default_config,
@@ -57,6 +56,7 @@ _cfgs = {
     "LeapCubeReorient": leap_cube_reorient.default_config,
     "LeapCubeRotateZAxis": leap_rotate_z.default_config,
     "AeroCubeRotateZAxis": aero_hand_rotate_z.default_config,
+    "AirbotPlayPickCube": airbot_pick.default_config,
 }
 
 _randomizer = {

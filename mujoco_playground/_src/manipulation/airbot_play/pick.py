@@ -40,7 +40,7 @@ def default_config() -> config_dict.ConfigDict:
   return config
 
 
-class AirbotPlayPick(airbot_play.AirbotPlayBase):
+class AirbotPlayPickCube(airbot_play.AirbotPlayBase):
   """Bring a box to a target."""
 
   def __init__(
@@ -80,7 +80,7 @@ class AirbotPlayPick(airbot_play.AirbotPlayBase):
         self._mj_model.jnt_qposadr[self._mj_model.joint(j).id]
         for j in all_joints
     ])
-    self._gripper_site = self._mj_model.site("gripper").id
+    self._gripper_site = self._mj_model.site("endpoint").id
     self._left_finger_geom = self._mj_model.geom("left_finger_pad").id
     self._right_finger_geom = self._mj_model.geom("right_finger_pad").id
     self._hand_geom = self._mj_model.geom("hand_box").id
@@ -159,7 +159,7 @@ class AirbotPlayPick(airbot_play.AirbotPlayBase):
         "out_of_bounds": jp.array(0.0, dtype=float),
         **{k: 0.0 for k in self._config.reward_config.scales.keys()},
     }
-    info = {"rng": rng, "target_pos": target_pos, "reached_box": 0.0}
+    info = {"rng": rng, "target_pos": target_pos, "reached_box": 0.0, "reach_target": False}
     obs = self._get_obs(data, info)
     reward, done = jp.zeros(2)
     state = State(data, obs, reward, done, metrics, info)
@@ -181,7 +181,7 @@ class AirbotPlayPick(airbot_play.AirbotPlayBase):
     box_pos = data.xpos[self._obj_body]
     out_of_bounds = jp.any(jp.abs(box_pos) > 1.0)
     out_of_bounds |= box_pos[2] < 0.0
-    done = out_of_bounds | jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any()
+    done = out_of_bounds | jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any() | state.info["reach_target"]
     done = done.astype(float)
 
     state.metrics.update(
@@ -223,6 +223,7 @@ class AirbotPlayPick(airbot_play.AirbotPlayBase):
         info["reached_box"],
         (jp.linalg.norm(box_pos - gripper_pos) < 0.012),
     )
+    info["reach_target"] = pos_err < 0.01
 
     rewards = {
         "gripper_box": gripper_box,
