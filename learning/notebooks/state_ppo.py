@@ -19,7 +19,8 @@ Original notebook: MuJoCo Playground manipulation example.
 import os
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("__EGL_EXTERNAL_PLATFORM_CONFIG_DIR",
-                      "/data/yufei/egl_external_platform.d")
+                      "/data/code/junzhe/egl_external_platform.d")
+os.environ["JAX_COMPILATION_CACHE_DIR"] = "/data/code/junzhe/jax_cache"
 import subprocess
 
 

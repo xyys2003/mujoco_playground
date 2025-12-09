@@ -73,7 +73,6 @@ def default_config():
       obs_noise=config_dict.create(brightness=[1.0, 1.0]),
       box_init_range=0.05,
       success_threshold=0.05,
-      success_height_threshold=0.15,
       action_history_length=1,
       impl='jax',
       nconmax=12 * 1024,
@@ -142,7 +141,6 @@ class PandaPickCubeCartesian(pick.PandaPickCube):
             'Madrona MJX not installed. Cannot use vision with'
             ' PandaPickCubeCartesian.'
         )
-        self._vision = False
         return
       self.renderer = BatchRenderer(
           m=self._mjx_model,
@@ -234,7 +232,6 @@ class PandaPickCubeCartesian(pick.PandaPickCube):
         },
         'reward/success': jp.array(0.0),
         'reward/lifted': jp.array(0.0),
-        'success': jp.array(0.0),
     }
 
     info = {
@@ -378,7 +375,6 @@ class PandaPickCubeCartesian(pick.PandaPickCube):
     state.metrics.update({
         'reward/lifted': lifted.astype(float),
         'reward/success': success.astype(float),
-        'success': success.astype(float),
     })
 
     done = (
@@ -419,15 +415,7 @@ class PandaPickCubeCartesian(pick.PandaPickCube):
         self._vision
     ):  # Randomized camera positions cannot see location along y line.
       box_pos, target_pos = box_pos[2], target_pos[2]
-      horizontal_close = True
-    else:
-      horizontal_close = (
-          jp.linalg.norm(box_pos[:2] - target_pos[:2])
-          < self._config.success_threshold
-      )
-
-    height_reached = box_pos[2] > self._config.success_height_threshold
-    return horizontal_close & height_reached
+    return jp.linalg.norm(box_pos - target_pos) < self._config.success_threshold
 
   def _move_tip(
       self,

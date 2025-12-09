@@ -2,8 +2,8 @@ from mujoco_playground import registry
 import os 
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("__EGL_EXTERNAL_PLATFORM_CONFIG_DIR",
-                      "/data/yufei/egl_external_platform.d")
-os.environ["JAX_COMPILATION_CACHE_DIR"] = "/data/yufei/jax_cache"
+                      "/data/code/junzhe/egl_external_platform.d")
+os.environ["JAX_COMPILATION_CACHE_DIR"] = "/data/code/junzhe/jax_cache"
 # Reuse all PPO plumbing from the state-based script.
 import state_ppo as _ppo
 

@@ -94,12 +94,6 @@ class RSLRLBraxWrapper(VecEnv):
   ):
     import torch  # pytype: disable=import-error # pylint: disable=redefined-outer-name,unused-import,import-outside-toplevel
 
-    if TensorDict is None:
-      raise ImportError(
-          "`tensordict` is required for torch interoperability; please install it "
-          "(e.g. `pip install tensordict`) before creating RSLRLBraxWrapper."
-      )
-
     self.seed = seed
     self.batch_size = num_actors
     self.num_envs = num_actors

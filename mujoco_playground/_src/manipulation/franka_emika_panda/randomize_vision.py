@@ -24,14 +24,10 @@ import numpy as np
 from mujoco_playground._src.manipulation.franka_emika_panda import pick_cartesian
 
 
-def sample_light_position(key: jax.Array):
-  """Samples a light position using a deterministic numpy RNG seed."""
-  # Ensure we convert a scalar array to a Python integer for seeding numpy.
-  seed = int(jax.random.bits(key, shape=(), dtype=jp.uint64).item())
-  rng = np.random.default_rng(seed)
+def sample_light_position():
   position = np.zeros(3)
   while np.linalg.norm(position) < 1.0:
-    position = rng.uniform([1.5, -0.2, 0.8], [3, 0.2, 1.5])
+    position = np.random.uniform([1.5, -0.2, 0.8], [3, 0.2, 1.5])
   return position
 
 
@@ -60,7 +56,7 @@ def perturb_orientation(
 
 
 def domain_randomize(
-    mjx_model: mjx.Model, num_worlds: int, rng: jax.Array
+    mjx_model: mjx.Model, num_worlds: int
 ) -> Tuple[mjx.Model, mjx.Model]:
   """Tile the necessary axes for the Madrona BatchRenderer."""
   mj_model = pick_cartesian.PandaPickCubeCartesian().mj_model
@@ -79,14 +75,12 @@ def domain_randomize(
       'light_type': 0,
       'light_castshadow': 0,
   })
-  # Ensure we have one RNG key per world.
-  if rng.shape[0] == num_worlds:
-    rng_per_world = rng
-  else:
-    rng_per_world = jax.random.split(rng, num_worlds)
+  rng = jax.random.key(0)
 
   # Simpler logic implementing via Numpy.
-  light_positions = jp.array([sample_light_position(key) for key in rng_per_world])
+  np.random.seed(0)
+  light_positions = [sample_light_position() for _ in range(num_worlds)]
+  light_positions = jp.array(light_positions)
 
   @jax.vmap
   def rand(rng: jax.Array, light_position: jax.Array):
@@ -177,7 +171,7 @@ def domain_randomize(
       light_dir,
       light_type,
       light_castshadow,
-  ) = rand(rng_per_world, light_positions)
+  ) = rand(jax.random.split(rng, num_worlds), light_positions)
 
   mjx_model = mjx_model.tree_replace({
       'geom_rgba': geom_rgba,

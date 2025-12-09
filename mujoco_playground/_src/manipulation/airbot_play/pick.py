@@ -4,12 +4,12 @@ from typing import Any, Dict, Optional, Union
 
 import jax
 import jax.numpy as jp
+from ml_collections import config_dict
 from mujoco import mjx
 from mujoco.mjx._src import math
 from mujoco_playground._src import mjx_env
 from mujoco_playground._src.manipulation.airbot_play import airbot_play
 from mujoco_playground._src.mjx_env import State
-from ml_collections import config_dict
 import numpy as np
 
 
@@ -26,11 +26,11 @@ def default_config() -> config_dict.ConfigDict:
               # Gripper goes to the box.
               gripper_box=4.0,
               # Box goes to the target mocap.
-              box_target=8.0,
+              box_target=30.0,
               # Do not collide the gripper with the floor.
               no_floor_collision=0.25,
               # Arm stays close to target pose.
-              robot_target_qpos=0.3,
+              robot_target_qpos=0.1,
           )
       ),
       impl='jax',
@@ -159,7 +159,7 @@ class AirbotPlayPickCube(airbot_play.AirbotPlayBase):
         "out_of_bounds": jp.array(0.0, dtype=float),
         **{k: 0.0 for k in self._config.reward_config.scales.keys()},
     }
-    info = {"rng": rng, "target_pos": target_pos, "reached_box": 0.0, "reach_target": False}
+    info = {"rng": rng, "target_pos": target_pos, "reached_box": 0.0}
     obs = self._get_obs(data, info)
     reward, done = jp.zeros(2)
     state = State(data, obs, reward, done, metrics, info)
@@ -181,8 +181,10 @@ class AirbotPlayPickCube(airbot_play.AirbotPlayBase):
     box_pos = data.xpos[self._obj_body]
     out_of_bounds = jp.any(jp.abs(box_pos) > 1.0)
     out_of_bounds |= box_pos[2] < 0.0
-    done = out_of_bounds | jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any() | state.info["reach_target"]
+    done = out_of_bounds | jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any() | jp.isnan(reward)
     done = done.astype(float)
+
+    reward = jp.where(jp.isnan(reward), -1e4, reward)
 
     state.metrics.update(
         **raw_rewards, out_of_bounds=out_of_bounds.astype(float)
@@ -223,7 +225,6 @@ class AirbotPlayPickCube(airbot_play.AirbotPlayBase):
         info["reached_box"],
         (jp.linalg.norm(box_pos - gripper_pos) < 0.012),
     )
-    info["reach_target"] = pos_err < 0.01
 
     rewards = {
         "gripper_box": gripper_box,
@@ -238,8 +239,8 @@ class AirbotPlayPickCube(airbot_play.AirbotPlayBase):
     gripper_mat = data.site_xmat[self._gripper_site].ravel()
     target_mat = math.quat_to_mat(data.mocap_quat[self._mocap_target])
     obs = jp.concatenate([
-        data.qpos,
-        data.qvel,
+        data.qpos[self._robot_qposadr],
+        data.qvel[self._robot_qposadr],
         gripper_pos,
         gripper_mat[3:],
         data.xmat[self._obj_body].ravel()[3:],
