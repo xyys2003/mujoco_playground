@@ -100,11 +100,38 @@ print("JAX devices:", jax.devices())
 from mujoco_playground import wrapper,wrapper_torch  # this is the Brax-style wrapper file
 from mujoco_playground import registry
 from mujoco_playground._src.wrapper_torch import RSLRLBraxWrapper
+from mujoco_playground.config import dm_control_suite_params, locomotion_params, manipulation_params
 # ===== Environment setup =====
 
 env_name = 'AirbotPlayPickCube'
 env = registry.load(env_name)                     # MjxEnv (JAX)
 env_cfg = registry.get_default_config(env_name)   # contains episode_length, action_repeat, etc.
+
+
+def _brax_tuned_ppo_config(env_name: str):
+    """Fetch the playground's tuned Brax PPO config for the target env.
+
+    Falling back to ``None`` keeps the script usable when a new environment is
+    added without a corresponding config entry yet.
+    """
+
+    if env_name in registry.manipulation._envs:
+        return manipulation_params.brax_ppo_config(env_name)
+    if env_name in registry.locomotion._envs:
+        return locomotion_params.brax_ppo_config(env_name)
+    if env_name in registry.dm_control_suite._envs:
+        return dm_control_suite_params.brax_ppo_config(env_name)
+    return None
+
+
+_brax_cfg = _brax_tuned_ppo_config(env_name)
+
+
+def _cfg_value(key: str, default):
+    if _brax_cfg is None:
+        return default
+    return _brax_cfg.get(key, default)
+
 
 print("Loaded MuJoCo Playground env:", env_name)
 print("Env config:", env_cfg)
@@ -114,7 +141,7 @@ print("Env config:", env_cfg)
 # ==============================================================
 
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections import defaultdict
 
 import gymnasium as gym
@@ -152,27 +179,27 @@ class Args:
 
     # Algorithm specific arguments
     env_id: str = "AirbotPlayPickCube"  # 仅用于命名，不用来 gym.make
-    total_timesteps: int = 1000000
-    learning_rate: float = 3e-4
-    num_envs: int = 64
-    num_eval_envs: int = 8
+    total_timesteps: int = field(default_factory=lambda: int(_cfg_value("num_timesteps", 1_000_000)))
+    learning_rate: float = field(default_factory=lambda: float(_cfg_value("learning_rate", 3e-4)))
+    num_envs: int = field(default_factory=lambda: int(_cfg_value("num_envs", 64)))
+    num_eval_envs: int = field(default_factory=lambda: int(_cfg_value("num_eval_envs", 8)))
 
-    num_steps: int = 50
-    num_eval_steps: int = 50
+    num_steps: int = field(default_factory=lambda: int(_cfg_value("unroll_length", 50)))
+    num_eval_steps: int = field(default_factory=lambda: int(_cfg_value("unroll_length", 50)))
 
     anneal_lr: bool = False
-    gamma: float = 0.99
+    gamma: float = field(default_factory=lambda: float(_cfg_value("discounting", 0.99)))
     gae_lambda: float = 0.95
-    num_minibatches: int = 16
-    update_epochs: int = 4
+    num_minibatches: int = field(default_factory=lambda: int(_cfg_value("num_minibatches", 16)))
+    update_epochs: int = field(default_factory=lambda: int(_cfg_value("num_updates_per_batch", 4)))
     norm_adv: bool = True
-    clip_coef: float = 0.2
+    clip_coef: float = field(default_factory=lambda: float(_cfg_value("clipping_epsilon", 0.2)))
     clip_vloss: bool = False
-    ent_coef: float = 0.0
+    ent_coef: float = field(default_factory=lambda: float(_cfg_value("entropy_cost", 0.0)))
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     target_kl: Optional[float] = 0.1
-    reward_scale: float = 1.0
+    reward_scale: float = field(default_factory=lambda: float(_cfg_value("reward_scaling", 1.0)))
     eval_freq: int = 25
     finite_horizon_gae: bool = False
     success_once: bool = True
@@ -446,6 +473,20 @@ def main():
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
+
+    if _brax_cfg is not None:
+        print(
+            "Using MuJoCo Playground tuned PPO defaults:",
+            {
+                "num_envs": args.num_envs,
+                "num_steps": args.num_steps,
+                "learning_rate": args.learning_rate,
+                "entropy_cost": args.ent_coef,
+                "num_minibatches": args.num_minibatches,
+                "update_epochs": args.update_epochs,
+                "total_timesteps": args.total_timesteps,
+            },
+        )
 
     if args.exp_name is None:
         run_name = f"{args.env_id}__ppo_torch__{args.seed}__{int(time.time())}"
