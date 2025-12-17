@@ -18,6 +18,16 @@ import datetime
 import functools
 import json
 import os
+xla_flags = os.environ.get("XLA_FLAGS", "")
+xla_flags += " --xla_gpu_triton_gemm_any=True"
+os.environ["XLA_FLAGS"] = xla_flags
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ.setdefault("MUJOCO_GL", "egl")
+os.environ.setdefault("__EGL_EXTERNAL_PLATFORM_CONFIG_DIR",
+                      "/data/code/junzhe/egl_external_platform.d")
+os.environ["JAX_COMPILATION_CACHE_DIR"] = "/data/code/junzhe/jax_cache"
+import subprocess
+
 import time
 import warnings
 
@@ -43,11 +53,7 @@ import tensorboardX
 import wandb
 
 
-xla_flags = os.environ.get("XLA_FLAGS", "")
-xla_flags += " --xla_gpu_triton_gemm_any=True"
-os.environ["XLA_FLAGS"] = xla_flags
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["MUJOCO_GL"] = "egl"
+
 
 # Ignore the info logs from brax
 logging.set_verbosity(logging.WARNING)

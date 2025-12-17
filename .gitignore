@@ -7,3 +7,4 @@ mujoco_menagerie
 checkpoints/
 logs
 runs/
+mujoco_playground/experimental/sim2sim/onnx/*.onnx

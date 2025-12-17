@@ -38,9 +38,9 @@ def default_config() -> config_dict.ConfigDict:
       reward_config=config_dict.create(
           scales=config_dict.create(
               # Gripper goes to the box.
-              gripper_box=4.0,
+              gripper_box=8.0,
               # Box goes to the target mocap.
-              box_target=8.0,
+              box_target=30.0,
               # Do not collide the gripper with the floor.
               no_floor_collision=0.25,
               # Arm stays close to target pose.
@@ -167,8 +167,10 @@ class PandaPickCube(panda.PandaBase):
     box_pos = data.xpos[self._obj_body]
     out_of_bounds = jp.any(jp.abs(box_pos) > 1.0)
     out_of_bounds |= box_pos[2] < 0.0
-    done = out_of_bounds | jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any()
+    done = out_of_bounds | jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any() | jp.isnan(reward)
     done = done.astype(float)
+
+    reward = jp.where(jp.isnan(reward), 0 , reward)
 
     state.metrics.update(
         **raw_rewards, out_of_bounds=out_of_bounds.astype(float)

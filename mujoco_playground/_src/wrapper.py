@@ -94,36 +94,29 @@ def wrap_for_brax_training(
         Callable[[mjx.Model], Tuple[mjx.Model, mjx.Model]]
     ] = None,
     full_reset: bool = False,
+    # NEW: allow external vision backend (e.g., Gaussian Splat in torch wrapper)
+    vision_backend: str = "madrona",  # "madrona" | "external"
 ) -> Wrapper:
   """Common wrapper pattern for all brax training agents.
 
-  Args:
-    env: environment to be wrapped
-    vision: whether the environment will be vision based
-    num_vision_envs: number of environments the renderer should generate, should
-      equal the number of batched envs
-    episode_length: length of episode
-    action_repeat: how many repeated actions to take per step
-    randomization_fn: randomization function that produces a vectorized model
-      and in_axes to vmap over
-    full_reset: whether to call `env.reset` during `env.step` on done rather
-      than resetting to a cached first state. Setting full_reset=True may
-      increase wallclock time because it forces full resets to random states.
-
-  Returns:
-    An environment that is wrapped with Episode and AutoReset wrappers.  If the
-    environment did not already have batch dimensions, it is additional Vmap
-    wrapped.
+  vision_backend:
+    - "madrona": original behavior (MadronaWrapper used when vision=True)
+    - "external": skip MadronaWrapper even if vision=True; caller produces pixels.
   """
-  if vision:
+  vb = (vision_backend or "madrona").lower().strip()
+
+  if vision and vb == "madrona":
     env = MadronaWrapper(env, num_vision_envs, randomization_fn)
-  elif randomization_fn is None:
-    env = brax_training.VmapWrapper(env)  # pytype: disable=wrong-arg-types
   else:
-    env = BraxDomainRandomizationVmapWrapper(env, randomization_fn)
+    if randomization_fn is None:
+      env = brax_training.VmapWrapper(env)  # pytype: disable=wrong-arg-types
+    else:
+      env = BraxDomainRandomizationVmapWrapper(env, randomization_fn)
+
   env = brax_training.EpisodeWrapper(env, episode_length, action_repeat)
   env = BraxAutoResetWrapper(env, full_reset=full_reset)
   return env
+
 
 
 class BraxAutoResetWrapper(Wrapper):
