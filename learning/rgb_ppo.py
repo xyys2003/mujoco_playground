@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import os
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.1"
+
 import json
 import time
 import random
-from dataclasses import dataclass
-from typing import Optional, Dict
+from dataclasses import dataclass, asdict
+from typing import Optional, Dict, List
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import imageio.v2 as imageio
 import tyro
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
@@ -62,6 +65,16 @@ class Args:
 
     # logging
     exp_name: Optional[str] = None
+    save_model: bool = True
+    checkpoint_interval: int = 10  # in PPO updates
+    resume_from: Optional[str] = None
+    eval_episodes: int = 0  # >0 to run evaluation after training (or eval_only)
+    eval_deterministic: bool = True
+    eval_only: bool = False
+
+    # debug rendering
+    debug_render_epochs: int = 3  # save rollout renderings for first N PPO updates
+    debug_render_dir: Optional[str] = None
 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
@@ -193,12 +206,120 @@ def _validate_plys(body_map: Dict[str, str], background_ply: Optional[str]):
         raise FileNotFoundError(msg)
 
 
+def _save_checkpoint(
+    args: Args,
+    run_name: str,
+    agent: Agent,
+    optimizer: optim.Optimizer,
+    global_step: int,
+    update: int,
+    path: Optional[str] = None,
+):
+    ckpt_dir = path or f"runs/{run_name}"
+    os.makedirs(ckpt_dir, exist_ok=True)
+    ckpt_path = os.path.join(ckpt_dir, f"ckpt_{update:05d}.pt")
+    torch.save(
+        {
+            "args": asdict(args),
+            "run_name": run_name,
+            "model_state": agent.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "global_step": global_step,
+            "update": update,
+        },
+        ckpt_path,
+    )
+    print(f"[checkpoint] saved to {ckpt_path}")
+
+
+def _save_debug_video(frames: List[np.ndarray], path: str, fps: int) -> None:
+    """Save a short rollout video for debugging (no-op if frames empty)."""
+
+    if not frames:
+        return
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Ensure HWC uint8 numpy arrays
+    proc_frames: List[np.ndarray] = []
+    for f in frames:
+        arr = np.asarray(f)
+        if arr.dtype != np.uint8:
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+        proc_frames.append(arr)
+
+    imageio.mimsave(path, proc_frames, fps=max(1, int(fps)))
+    print(f"[debug] saved rollout render to {path}")
+
+
+@torch.no_grad()
+def _evaluate_agent(
+    agent: Agent,
+    envs: MJXManiLikeVectorEnv,
+    device: torch.device,
+    num_episodes: int,
+    deterministic: bool = True,
+    max_steps: Optional[int] = None,
+):
+    agent.eval()
+
+    obs, _ = envs.reset()
+    for k, v in obs.items():
+        obs[k] = v.to(device)
+
+    ep_returns = torch.zeros(envs.num_envs, device=device)
+    completed = []
+    steps = 0
+    max_allowed_steps = max_steps or (num_episodes * 10_000)
+
+    while len(completed) < num_episodes and steps < max_allowed_steps:
+        if deterministic:
+            z = agent.feat(obs)
+            mean = agent.actor_mean(z)
+            action = mean
+        else:
+            action, _, _, _ = agent.get_action_and_value(obs)
+
+        cpu_action = action.detach().cpu()
+        nobs, rew, term, trunc, _ = envs.step(cpu_action)
+        for k, v in nobs.items():
+            nobs[k] = v.to(device)
+        rew = rew.to(device)
+        done = (term | trunc).to(device)
+
+        ep_returns += rew
+        if done.any():
+            done_idx = done.nonzero(as_tuple=False).view(-1)
+            for idx in done_idx:
+                completed.append(float(ep_returns[idx]))
+                if len(completed) >= num_episodes:
+                    break
+            ep_returns[done_idx] = 0.0
+        obs = nobs
+        steps += 1
+
+    return completed
+
+
 def main():
     args = tyro.cli(Args)
 
     run_name = args.exp_name or f"rgbppo_{args.env_name}__{args.seed}__{int(time.time())}"
     os.makedirs(f"runs/{run_name}", exist_ok=True)
     writer = SummaryWriter(f"runs/{run_name}")
+
+    debug_render_dir = args.debug_render_dir or os.path.join("runs", run_name, "render_debug")
+    debug_render_epochs = max(0, int(args.debug_render_epochs))
+    debug_render_fps = int(round(1.0 / max(args.ctrl_dt * args.action_repeat, 1e-6)))
+
+    def _maybe_get_frame(obs: Dict[str, torch.Tensor]) -> Optional[np.ndarray]:
+        if "rgb" not in obs:
+            return None
+        frame_t = obs["rgb"][0]
+        if frame_t.is_floating_point():
+            frame_t = (frame_t.clamp(0.0, 1.0) * 255.0).to(torch.uint8)
+        else:
+            frame_t = frame_t.to(torch.uint8)
+        return frame_t.detach().cpu().numpy()
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -262,6 +383,20 @@ def main():
     agent = Agent(action_dim, obs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate)
 
+    # Optional resume
+    start_update = 1
+    global_step = 0
+    if args.resume_from:
+        ckpt = torch.load(args.resume_from, map_location=device)
+        agent.load_state_dict(ckpt["model_state"])
+        optimizer.load_state_dict(ckpt.get("optimizer_state", {}))
+        global_step = int(ckpt.get("global_step", 0))
+        start_update = int(ckpt.get("update", 0)) + 1
+        prev_run = ckpt.get("run_name")
+        if isinstance(prev_run, str):
+            print(f"[resume] previous run name: {prev_run}")
+        print(f"[resume] start update {start_update}, global_step {global_step}")
+
     # rollout buffers (minimal)
     num_steps = args.num_steps
     num_envs = args.num_envs
@@ -274,92 +409,143 @@ def main():
 
     next_obs = obs
     next_done = torch.zeros((num_envs,), device=device)
-
-    global_step = 0
     batch_size = num_steps * num_envs
     minibatch_size = batch_size // args.num_minibatches
     num_updates = args.total_timesteps // batch_size
 
-    for update in range(1, num_updates + 1):
-        for step in range(num_steps):
-            global_step += num_envs
-            done_buf[step] = next_done
+    if args.eval_only and args.eval_episodes <= 0:
+        raise ValueError("eval_only=True requires eval_episodes > 0")
 
-            for k in obs_buf:
-                obs_buf[k][step] = next_obs[k]
+    if not args.eval_only:
+        for update in range(start_update, num_updates + 1):
+            debug_frames: List[np.ndarray] = []
+            record_debug = (debug_render_epochs > 0) and ((update - start_update) < debug_render_epochs)
 
+            for step in range(num_steps):
+                global_step += num_envs
+                done_buf[step] = next_done
+
+                for k in obs_buf:
+                    obs_buf[k][step] = next_obs[k]
+
+                if record_debug:
+                    frame = _maybe_get_frame(next_obs)
+                    if frame is not None:
+                        debug_frames.append(frame)
+
+                with torch.no_grad():
+                    a, lp, ent, v = agent.get_action_and_value(next_obs)
+                act_buf[step] = a
+                logp_buf[step] = lp
+                val_buf[step] = v
+
+                # step env (env returns on CPU torch tensors)
+                cpu_action = a.detach().cpu()
+                nobs, rew, term, trunc, infos = envs.step(cpu_action)
+                for k, v in nobs.items():
+                    nobs[k] = v.to(device)
+                rew = rew.to(device)
+                done = (term | trunc).to(device).float()
+
+                rew_buf[step] = rew
+                next_obs = nobs
+                next_done = done
+
+                if record_debug:
+                    frame = _maybe_get_frame(next_obs)
+                    if frame is not None:
+                        debug_frames.append(frame)
+
+            # GAE
             with torch.no_grad():
-                a, lp, ent, v = agent.get_action_and_value(next_obs)
-            act_buf[step] = a
-            logp_buf[step] = lp
-            val_buf[step] = v
+                _, _, _, next_value = agent.get_action_and_value(next_obs, action=None)
+                adv = torch.zeros_like(rew_buf, device=device)
+                lastgaelam = 0
+                for t in reversed(range(num_steps)):
+                    if t == num_steps - 1:
+                        nextnonterminal = 1.0 - next_done
+                        nextvalues = next_value
+                    else:
+                        nextnonterminal = 1.0 - done_buf[t + 1]
+                        nextvalues = val_buf[t + 1]
+                    delta = rew_buf[t] + args.gamma * nextvalues * nextnonterminal - val_buf[t]
+                    lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
+                    adv[t] = lastgaelam
+                ret = adv + val_buf
 
-            # step env (env returns on CPU torch tensors)
-            cpu_action = a.detach().cpu()
-            nobs, rew, term, trunc, infos = envs.step(cpu_action)
-            for k, v in nobs.items():
-                nobs[k] = v.to(device)
-            rew = rew.to(device)
-            done = (term | trunc).to(device).float()
+            # flatten
+            b_obs = {k: v.reshape((-1,) + v.shape[2:]) for k, v in obs_buf.items()}
+            b_act = act_buf.reshape((-1, action_dim))
+            b_logp = logp_buf.reshape(-1)
+            b_adv = adv.reshape(-1)
+            b_ret = ret.reshape(-1)
+            b_val = val_buf.reshape(-1)
 
-            rew_buf[step] = rew
-            next_obs = nobs
-            next_done = done
+            inds = np.arange(batch_size)
+            for epoch in range(args.update_epochs):
+                np.random.shuffle(inds)
+                for start in range(0, batch_size, minibatch_size):
+                    mb = inds[start:start + minibatch_size]
+                    mb_obs = {k: v[mb] for k, v in b_obs.items()}
 
-        # GAE
-        with torch.no_grad():
-            _, _, _, next_value = agent.get_action_and_value(next_obs, action=None)
-            adv = torch.zeros_like(rew_buf, device=device)
-            lastgaelam = 0
-            for t in reversed(range(num_steps)):
-                if t == num_steps - 1:
-                    nextnonterminal = 1.0 - next_done
-                    nextvalues = next_value
-                else:
-                    nextnonterminal = 1.0 - done_buf[t + 1]
-                    nextvalues = val_buf[t + 1]
-                delta = rew_buf[t] + args.gamma * nextvalues * nextnonterminal - val_buf[t]
-                lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
-                adv[t] = lastgaelam
-            ret = adv + val_buf
+                    new_a, new_logp, ent, new_v = agent.get_action_and_value(mb_obs, b_act[mb])
+                    ratio = (new_logp - b_logp[mb]).exp()
 
-        # flatten
-        b_obs = {k: v.reshape((-1,) + v.shape[2:]) for k, v in obs_buf.items()}
-        b_act = act_buf.reshape((-1, action_dim))
-        b_logp = logp_buf.reshape(-1)
-        b_adv = adv.reshape(-1)
-        b_ret = ret.reshape(-1)
-        b_val = val_buf.reshape(-1)
+                    mb_adv = b_adv[mb]
+                    mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
 
-        inds = np.arange(batch_size)
-        for epoch in range(args.update_epochs):
-            np.random.shuffle(inds)
-            for start in range(0, batch_size, minibatch_size):
-                mb = inds[start:start + minibatch_size]
-                mb_obs = {k: v[mb] for k, v in b_obs.items()}
+                    pg1 = -mb_adv * ratio
+                    pg2 = -mb_adv * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
+                    pg_loss = torch.max(pg1, pg2).mean()
 
-                new_a, new_logp, ent, new_v = agent.get_action_and_value(mb_obs, b_act[mb])
-                ratio = (new_logp - b_logp[mb]).exp()
+                    v_loss = 0.5 * (new_v - b_ret[mb]).pow(2).mean()
+                    ent_loss = ent.mean()
+                    loss = pg_loss + args.vf_coef * v_loss - args.ent_coef * ent_loss
 
-                mb_adv = b_adv[mb]
-                mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
+                    optimizer.zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                    optimizer.step()
 
-                pg1 = -mb_adv * ratio
-                pg2 = -mb_adv * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
-                pg_loss = torch.max(pg1, pg2).mean()
+            writer.add_scalar("loss/pg", float(pg_loss.item()), global_step)
+            writer.add_scalar("loss/v", float(v_loss.item()), global_step)
+            writer.add_scalar("charts/step", global_step, global_step)
 
-                v_loss = 0.5 * (new_v - b_ret[mb]).pow(2).mean()
-                ent_loss = ent.mean()
-                loss = pg_loss + args.vf_coef * v_loss - args.ent_coef * ent_loss
+            if record_debug and debug_frames:
+                vid_path = os.path.join(debug_render_dir, f"update_{update:03d}.mp4")
+                _save_debug_video(debug_frames, vid_path, fps=debug_render_fps)
 
-                optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
-                optimizer.step()
+            if args.save_model and update % max(1, args.checkpoint_interval) == 0:
+                _save_checkpoint(
+                    args=args,
+                    run_name=run_name,
+                    agent=agent,
+                    optimizer=optimizer,
+                    global_step=global_step,
+                    update=update,
+                )
 
-        writer.add_scalar("loss/pg", float(pg_loss.item()), global_step)
-        writer.add_scalar("loss/v", float(v_loss.item()), global_step)
-        writer.add_scalar("charts/step", global_step, global_step)
+    if args.save_model and not args.eval_only:
+        final_path = f"runs/{run_name}/final_ckpt.pt"
+        torch.save(agent.state_dict(), final_path)
+        print(f"[checkpoint] final model saved to {final_path}")
+
+    if args.eval_episodes > 0:
+        eval_max_steps = args.eval_episodes * (episode_length * args.action_repeat + 10)
+        returns = _evaluate_agent(
+            agent=agent,
+            envs=envs,
+            device=device,
+            num_episodes=args.eval_episodes,
+            deterministic=args.eval_deterministic,
+            max_steps=eval_max_steps,
+        )
+        if returns:
+            mean_ret = float(np.mean(returns))
+            print(f"[eval] mean reward over {len(returns)} episodes: {mean_ret:.3f}")
+            writer.add_scalar("eval/episode_reward", mean_ret, global_step)
+        else:
+            print("[eval] no completed episodes during evaluation")
 
     writer.close()
 

@@ -1,0 +1,11 @@
+{
+  "arm_base": "/home/junzhe/code/mjpl/mujoco_playground/mujoco_playground/_src/manipulation/airbot_play/3dgs/224/arm_base.ply",
+  "link1": "/home/junzhe/code/mjpl/mujoco_playground/mujoco_playground/_src/manipulation/airbot_play/3dgs/224/link1.ply",
+  "link2": "/home/junzhe/code/mjpl/mujoco_playground/mujoco_playground/_src/manipulation/airbot_play/3dgs/224/link2.ply",
+  "link3": "/home/junzhe/code/mjpl/mujoco_playground/mujoco_playground/_src/manipulation/airbot_play/3dgs/224/link3.ply",
+  "link4": "/home/junzhe/code/mjpl/mujoco_playground/mujoco_playground/_src/manipulation/airbot_play/3dgs/224/link4.ply",
+  "link5": "/home/junzhe/code/mjpl/mujoco_playground/mujoco_playground/_src/manipulation/airbot_play/3dgs/224/link5.ply",
+  "link6": "/home/junzhe/code/mjpl/mujoco_playground/mujoco_playground/_src/manipulation/airbot_play/3dgs/224/link6.ply",
+  "left": "/home/junzhe/code/mjpl/mujoco_playground/mujoco_playground/_src/manipulation/airbot_play/3dgs/224/left.ply",
+  "right": "/home/junzhe/code/mjpl/mujoco_playground/mujoco_playground/_src/manipulation/airbot_play/3dgs/224/right.ply"
+}
