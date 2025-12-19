@@ -6,6 +6,7 @@ os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.1"
 import json
 import time
 import random
+from collections import defaultdict
 from dataclasses import dataclass, asdict
 from typing import Optional, Dict, List
 
@@ -62,6 +63,8 @@ class Args:
     vf_coef: float = 0.5
     ent_coef: float = 0.0
     max_grad_norm: float = 0.5
+    reward_scale: float = 1.0
+    success_once: bool = True
 
     # logging
     exp_name: Optional[str] = None
@@ -232,23 +235,75 @@ def _save_checkpoint(
     print(f"[checkpoint] saved to {ckpt_path}")
 
 
-def _save_debug_video(frames: List[np.ndarray], path: str, fps: int) -> None:
+def _save_debug_video(
+    frames: List[np.ndarray],
+    path: str,
+    fps: int,
+    first_frame_path: Optional[str] = None,
+) -> None:
     """Save a short rollout video for debugging (no-op if frames empty)."""
 
     if not frames:
         return
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    # Ensure HWC uint8 numpy arrays
-    proc_frames: List[np.ndarray] = []
-    for f in frames:
-        arr = np.asarray(f)
-        if arr.dtype != np.uint8:
-            arr = np.clip(arr, 0, 255).astype(np.uint8)
-        proc_frames.append(arr)
 
-    imageio.mimsave(path, proc_frames, fps=max(1, int(fps)))
-    print(f"[debug] saved rollout render to {path}")
+    proc: List[np.ndarray] = []
+    for f in frames:
+        a = np.asarray(f)
+
+        # Ensure HWC
+        if a.ndim == 2:  # gray -> RGB
+            a = np.repeat(a[..., None], 3, axis=2)
+        if a.ndim != 3:
+            continue
+
+        # Ensure 3 channels
+        if a.shape[-1] == 4:  # RGBA -> RGB
+            a = a[..., :3]
+        if a.shape[-1] != 3:
+            continue
+
+        # Ensure uint8 [0,255]
+        if a.dtype != np.uint8:
+            a = np.clip(a, 0, 255).astype(np.uint8)
+
+        proc.append(a)
+
+    if not proc:
+        return
+
+    # Save first frame png if requested
+    if first_frame_path is not None:
+        try:
+            imageio.imwrite(first_frame_path, proc[0])
+            print(f"[debug] saved rollout first frame to {first_frame_path}")
+        except Exception as exc:
+            print(f"[debug] failed to save first frame to {first_frame_path}: {exc}")
+
+    # Ensure consistent shape across frames (drop inconsistent frames)
+    H, W, C = proc[0].shape
+    proc = [p for p in proc if p.shape == (H, W, C)]
+    if not proc:
+        return
+
+    # Write mp4 robustly (avoid macroblock auto-resize + enforce pix_fmt)
+    try:
+        writer = imageio.get_writer(
+            path,
+            fps=max(1, int(fps)),
+            format="ffmpeg",
+            codec="libx264",
+            macro_block_size=16,  
+        )
+        try:
+            for p in proc:
+                writer.append_data(p)
+        finally:
+            writer.close()
+        print(f"[debug] saved rollout render to {path}")
+    except Exception as exc:
+        print(f"[debug] failed to save rollout render to {path}: {exc}")
 
 
 @torch.no_grad()
@@ -420,6 +475,8 @@ def main():
         for update in range(start_update, num_updates + 1):
             debug_frames: List[np.ndarray] = []
             record_debug = (debug_render_epochs > 0) and ((update - start_update) < debug_render_epochs)
+            rollout_logs: Dict[str, List[float]] = defaultdict(list)
+            success_once_tracker = torch.zeros(num_envs, device=device, dtype=torch.bool)
 
             for step in range(num_steps):
                 global_step += num_envs
@@ -444,17 +501,57 @@ def main():
                 nobs, rew, term, trunc, infos = envs.step(cpu_action)
                 for k, v in nobs.items():
                     nobs[k] = v.to(device)
-                rew = rew.to(device)
+                rew = rew.to(device) * float(args.reward_scale)
                 done = (term | trunc).to(device).float()
 
                 rew_buf[step] = rew
                 next_obs = nobs
                 next_done = done
 
+                success_values = None
+                for k, v in infos.get("log", {}).items():
+                    if isinstance(v, torch.Tensor):
+                        rollout_logs[k].append(v.float().mean().item())
+                    else:
+                        try:
+                            rollout_logs[k].append(float(v))
+                        except Exception:
+                            continue
+
+                    if k in ("success", "is_success"):
+                        if isinstance(v, torch.Tensor):
+                            success_values = v.to(device)
+                        else:
+                            try:
+                                success_values = torch.as_tensor(v, device=device)
+                            except Exception:
+                                success_values = None
+                    elif k == "reward/success":
+                        if isinstance(v, torch.Tensor):
+                            success_values = (v > 0).to(device)
+                        else:
+                            try:
+                                success_values = torch.as_tensor(v, device=device) > 0
+                            except Exception:
+                                success_values = None
+
+                if args.success_once:
+                    if success_values is not None:
+                        success_once_tracker |= success_values.bool().view(-1)
+                    if done.any():
+                        ended = done.bool()
+                        rollout_logs["success_once"].append(
+                            success_once_tracker[ended].float().mean().item()
+                        )
+                        success_once_tracker[ended] = False
+
                 if record_debug:
                     frame = _maybe_get_frame(next_obs)
                     if frame is not None:
                         debug_frames.append(frame)
+
+            rollout_reward_mean = float(rew_buf.mean().item())
+            rollout_return_mean = float(rew_buf.sum(dim=0).mean().item())
 
             # GAE
             with torch.no_grad():
@@ -509,11 +606,29 @@ def main():
 
             writer.add_scalar("loss/pg", float(pg_loss.item()), global_step)
             writer.add_scalar("loss/v", float(v_loss.item()), global_step)
+            writer.add_scalar("loss/entropy", float(ent_loss.item()), global_step)
+            writer.add_scalar("rollout/reward_mean", rollout_reward_mean, global_step)
+            writer.add_scalar("rollout/return_mean", rollout_return_mean, global_step)
             writer.add_scalar("charts/step", global_step, global_step)
+            for log_key, values in rollout_logs.items():
+                if values:
+                    writer.add_scalar(f"env/{log_key}", float(np.mean(values)), global_step)
 
             if record_debug and debug_frames:
                 vid_path = os.path.join(debug_render_dir, f"update_{update:03d}.mp4")
-                _save_debug_video(debug_frames, vid_path, fps=debug_render_fps)
+                frame_path = os.path.join(debug_render_dir, f"update_{update:03d}_first.png")
+                writer.add_image(
+                    "debug/first_frame",
+                    debug_frames[0],
+                    global_step=global_step,
+                    dataformats="HWC",
+                )
+                _save_debug_video(
+                    debug_frames,
+                    vid_path,
+                    fps=debug_render_fps,
+                    first_frame_path=frame_path,
+                )
 
             if args.save_model and update % max(1, args.checkpoint_interval) == 0:
                 _save_checkpoint(
