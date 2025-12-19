@@ -284,5 +284,12 @@ class MJXManiLikeVectorEnv:
 
         terminations = done
         truncations = torch.zeros_like(done, dtype=torch.bool, device=self.torch_device)
-        infos: Dict[str, Any] = {}
+        infos: Dict[str, Any] = {"log": {}}
+        metrics = getattr(next_state, "metrics", None)
+        if metrics:
+            for k, v in metrics.items():
+                try:
+                    infos["log"][k] = _jax_to_torch(v).float().mean().item()
+                except Exception:
+                    continue
         return obs, rew, terminations, truncations, infos
