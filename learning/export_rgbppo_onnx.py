@@ -237,6 +237,8 @@ def main():
 
     gs_assets_reso = str(train_args.get("gs_assets_reso", "224"))
     gs_camera_id = int(train_args.get("gs_camera_id", 0))
+    gs_camera_ids = train_args.get("gs_camera_ids", None)
+    gs_camera_names = train_args.get("gs_camera_names", None)
     gs_disable_bg = bool(train_args.get("gs_disable_bg", False))
     gs_minibatch = int(train_args.get("gs_minibatch", 32))
     gs_height = int(train_args.get("gs_height", 128))
@@ -278,6 +280,8 @@ def main():
         gs_body_gaussians=body_map,
         gs_background_ply=bg_ply,
         gs_camera_id=gs_camera_id,
+        gs_camera_ids=gs_camera_ids,
+        gs_camera_names=gs_camera_names,
         gs_height=gs_height,
         gs_width=gs_width,
         gs_minibatch=gs_minibatch,
@@ -356,7 +360,13 @@ def main():
         os.makedirs(out_dir, exist_ok=True)
 
     print(f"[export] ckpt={args.ckpt}")
-    print(f"[export] env={env_name} gs={gs_width}x{gs_height} cam_id={gs_camera_id}")
+    if gs_camera_names:
+        cam_info = f"cam_names={gs_camera_names}"
+    elif gs_camera_ids:
+        cam_info = f"cam_ids={gs_camera_ids}"
+    else:
+        cam_info = f"cam_id={gs_camera_id}"
+    print(f"[export] env={env_name} gs={gs_width}x{gs_height} {cam_info}")
     print(f"[export] signature={'(rgb,state)->action' if export_with_state else 'rgb->action'}")
     print(f"[export] output={args.output} device={device}")
 
