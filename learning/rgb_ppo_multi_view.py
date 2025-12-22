@@ -308,6 +308,22 @@ def _save_debug_video(
         print(f"[debug] failed to save rollout render to {path}: {exc}")
 
 
+def _save_frame_sequence(
+    frames: List[np.ndarray],
+    out_dir: str,
+    prefix: str = "frame",
+) -> None:
+    if not frames:
+        return
+    os.makedirs(out_dir, exist_ok=True)
+    for idx, frame in enumerate(frames):
+        path = os.path.join(out_dir, f"{prefix}_{idx:04d}.png")
+        try:
+            imageio.imwrite(path, frame)
+        except Exception as exc:
+            print(f"[debug] failed to save frame {path}: {exc}")
+
+
 @torch.no_grad()
 def _evaluate_agent(
     agent: Agent,
@@ -321,7 +337,8 @@ def _evaluate_agent(
 
     obs, _ = envs.reset()
     for k, v in obs.items():
-        obs[k] = v.to(device)
+        if v.device != device:
+            obs[k] = v.to(device)
 
     ep_returns = torch.zeros(envs.num_envs, device=device)
     completed = []
@@ -336,12 +353,18 @@ def _evaluate_agent(
         else:
             action, _, _, _ = agent.get_action_and_value(obs)
 
-        cpu_action = action.detach().cpu()
-        nobs, rew, term, trunc, _ = envs.step(cpu_action)
+        env_action = action.detach().to(device=device, dtype=torch.float32).contiguous()
+        nobs, rew, term, trunc, _ = envs.step(env_action)
         for k, v in nobs.items():
-            nobs[k] = v.to(device)
-        rew = rew.to(device)
-        done = (term | trunc).to(device)
+            if v.device != device:
+                nobs[k] = v.to(device)
+        if rew.device != device:
+            rew = rew.to(device)
+        if term.device != device:
+            term = term.to(device)
+        if trunc.device != device:
+            trunc = trunc.to(device)
+        done = term | trunc
 
         ep_returns += rew
         if done.any():
@@ -389,8 +412,6 @@ def main():
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-
-    device = torch.device(f"cuda:{args.device_rank}" if torch.cuda.is_available() else "cpu")
 
     episode_length = int(args.episode_seconds / args.ctrl_dt)
 
@@ -442,9 +463,14 @@ def main():
         gs_disable_bg=args.gs_disable_bg,
     )
 
+    device = envs.torch_device
+
     obs, _ = envs.reset(seed=args.seed)
     for k, v in obs.items():
-        obs[k] = v.to(device)
+        if v.device != device:
+            obs[k] = v.to(device)
+    if args.include_state and "state" not in obs:
+        raise RuntimeError("include_state=True but env obs has no key 'state'")
 
     action_dim = int(envs.single_action_dim)
     agent = Agent(action_dim, obs).to(device)
@@ -471,12 +497,17 @@ def main():
     act_buf = torch.zeros((num_steps, num_envs, action_dim), device=device)
     logp_buf = torch.zeros((num_steps, num_envs), device=device)
     rew_buf = torch.zeros((num_steps, num_envs), device=device)
-    done_buf = torch.zeros((num_steps, num_envs), device=device)
+    term_buf = torch.zeros((num_steps, num_envs), device=device, dtype=torch.bool)
+    trunc_buf = torch.zeros((num_steps, num_envs), device=device, dtype=torch.bool)
     val_buf = torch.zeros((num_steps, num_envs), device=device)
 
     next_obs = obs
-    next_done = torch.zeros((num_envs,), device=device)
+    next_term = torch.zeros((num_envs,), device=device, dtype=torch.bool)
     batch_size = num_steps * num_envs
+    if batch_size % args.num_minibatches != 0:
+        raise ValueError(
+            f"batch_size ({batch_size}) must be divisible by num_minibatches ({args.num_minibatches})"
+        )
     minibatch_size = batch_size // args.num_minibatches
     num_updates = args.total_timesteps // batch_size
 
@@ -485,35 +516,19 @@ def main():
 
     if not args.eval_only:
         for update in range(start_update, num_updates + 1):
+            update_t0 = time.time()
             debug_frames: List[np.ndarray] = []
             debug_frames_by_view: Optional[List[List[np.ndarray]]] = None
             record_debug = (debug_render_epochs > 0) and ((update - start_update) < debug_render_epochs)
+            episode_frames: List[np.ndarray] = []
+            episode_complete = False
             rollout_logs: Dict[str, List[float]] = defaultdict(list)
             success_once_tracker = torch.zeros(num_envs, device=device, dtype=torch.bool)
 
             for step in range(num_steps):
                 global_step += num_envs
-                done_buf[step] = next_done
-
                 for k in obs_buf:
                     obs_buf[k][step] = next_obs[k]
-
-                if record_debug:
-                    frame_t = next_obs.get("rgb")
-                    if frame_t is not None:
-                        view_frames = _split_multi_view_frames(frame_t[0])
-                        if view_frames:
-                            if debug_frames_by_view is None:
-                                debug_frames_by_view = [[] for _ in range(len(view_frames))]
-                            for idx, view_frame in enumerate(view_frames):
-                                if idx < len(debug_frames_by_view):
-                                    debug_frames_by_view[idx].append(view_frame)
-                            composite = (
-                                np.concatenate(view_frames, axis=1)
-                                if len(view_frames) > 1
-                                else view_frames[0]
-                            )
-                            debug_frames.append(composite)
 
                 with torch.no_grad():
                     a, lp, ent, v = agent.get_action_and_value(next_obs)
@@ -521,17 +536,25 @@ def main():
                 logp_buf[step] = lp
                 val_buf[step] = v
 
-                # step env (env returns on CPU torch tensors)
-                cpu_action = a.detach().cpu()
-                nobs, rew, term, trunc, infos = envs.step(cpu_action)
+                env_action = a.detach().to(device=device, dtype=torch.float32).contiguous()
+                nobs, rew, term, trunc, infos = envs.step(env_action)
                 for k, v in nobs.items():
-                    nobs[k] = v.to(device)
-                rew = rew.to(device) * float(args.reward_scale)
-                done = (term | trunc).to(device).float()
+                    if v.device != device:
+                        nobs[k] = v.to(device)
+                if rew.device != device:
+                    rew = rew.to(device)
+                if term.device != device:
+                    term = term.to(device)
+                if trunc.device != device:
+                    trunc = trunc.to(device)
+                rew = rew * float(args.reward_scale)
+                done = term | trunc
 
                 rew_buf[step] = rew
+                term_buf[step] = term
+                trunc_buf[step] = trunc
                 next_obs = nobs
-                next_done = done
+                next_term = term
 
                 success_values = None
                 for k, v in infos.get("log", {}).items():
@@ -544,19 +567,23 @@ def main():
                             continue
 
                     if k in ("success", "is_success"):
-                        if isinstance(v, torch.Tensor):
-                            success_values = v.to(device)
+                        if isinstance(v, torch.Tensor) and v.numel() == num_envs:
+                            success_values = v.to(device).view(-1)
                         else:
                             try:
-                                success_values = torch.as_tensor(v, device=device)
+                                value = torch.as_tensor(v, device=device)
+                                if value.numel() == num_envs:
+                                    success_values = value.view(-1)
                             except Exception:
                                 success_values = None
                     elif k == "reward/success":
-                        if isinstance(v, torch.Tensor):
-                            success_values = (v > 0).to(device)
+                        if isinstance(v, torch.Tensor) and v.numel() == num_envs:
+                            success_values = (v > 0).to(device).view(-1)
                         else:
                             try:
-                                success_values = torch.as_tensor(v, device=device) > 0
+                                value = torch.as_tensor(v, device=device)
+                                if value.numel() == num_envs:
+                                    success_values = value.view(-1) > 0
                             except Exception:
                                 success_values = None
 
@@ -564,7 +591,7 @@ def main():
                     if success_values is not None:
                         success_once_tracker |= success_values.bool().view(-1)
                     if done.any():
-                        ended = done.bool()
+                        ended = done
                         rollout_logs["success_once"].append(
                             success_once_tracker[ended].float().mean().item()
                         )
@@ -587,8 +614,27 @@ def main():
                             )
                             debug_frames.append(composite)
 
+                if not episode_complete:
+                    frame_t = next_obs.get("rgb")
+                    if frame_t is not None:
+                        view_frames = _split_multi_view_frames(frame_t[0])
+                        if view_frames:
+                            composite = (
+                                np.concatenate(view_frames, axis=1)
+                                if len(view_frames) > 1
+                                else view_frames[0]
+                            )
+                            episode_frames.append(composite)
+                    if done[0].item():
+                        episode_complete = True
+
             rollout_reward_mean = float(rew_buf.mean().item())
             rollout_return_mean = float(rew_buf.sum(dim=0).mean().item())
+            done_rate = float((term_buf | trunc_buf).float().mean().item())
+            termination_rate = float(term_buf.float().mean().item())
+            truncation_rate = float(trunc_buf.float().mean().item())
+            action_abs_mean = float(act_buf.abs().mean().item())
+            action_clip_frac = float((act_buf.abs() > 0.99).float().mean().item())
 
             # GAE
             with torch.no_grad():
@@ -597,10 +643,10 @@ def main():
                 lastgaelam = 0
                 for t in reversed(range(num_steps)):
                     if t == num_steps - 1:
-                        nextnonterminal = 1.0 - next_done
+                        nextnonterminal = 1.0 - next_term.float()
                         nextvalues = next_value
                     else:
-                        nextnonterminal = 1.0 - done_buf[t + 1]
+                        nextnonterminal = 1.0 - term_buf[t + 1].float()
                         nextvalues = val_buf[t + 1]
                     delta = rew_buf[t] + args.gamma * nextvalues * nextnonterminal - val_buf[t]
                     lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
@@ -615,6 +661,16 @@ def main():
             b_ret = ret.reshape(-1)
             b_val = val_buf.reshape(-1)
 
+            # PPO diagnostics
+            y_pred = b_val.detach().cpu().numpy()
+            y_true = b_ret.detach().cpu().numpy()
+            var_y = np.var(y_true)
+            explained_variance = np.nan if var_y == 0 else float(1 - np.var(y_true - y_pred) / var_y)
+
+            approx_kl_vals = []
+            clipfrac_vals = []
+            ratio_vals = []
+
             inds = np.arange(batch_size)
             for epoch in range(args.update_epochs):
                 np.random.shuffle(inds)
@@ -624,6 +680,10 @@ def main():
 
                     new_a, new_logp, ent, new_v = agent.get_action_and_value(mb_obs, b_act[mb])
                     ratio = (new_logp - b_logp[mb]).exp()
+                    with torch.no_grad():
+                        approx_kl_vals.append((b_logp[mb] - new_logp).mean().item())
+                        clipfrac_vals.append(((ratio - 1.0).abs() > args.clip_coef).float().mean().item())
+                        ratio_vals.append(ratio.mean().item())
 
                     mb_adv = b_adv[mb]
                     mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
@@ -644,8 +704,33 @@ def main():
             writer.add_scalar("loss/pg", float(pg_loss.item()), global_step)
             writer.add_scalar("loss/v", float(v_loss.item()), global_step)
             writer.add_scalar("loss/entropy", float(ent_loss.item()), global_step)
+            if approx_kl_vals:
+                writer.add_scalar("charts/approx_kl", float(np.mean(approx_kl_vals)), global_step)
+            if clipfrac_vals:
+                writer.add_scalar("charts/clipfrac", float(np.mean(clipfrac_vals)), global_step)
+            if ratio_vals:
+                ratio_mean = float(np.mean(ratio_vals))
+                ratio_std = float(np.std(ratio_vals))
+                writer.add_scalar("charts/ratio_mean", ratio_mean, global_step)
+                writer.add_scalar("charts/ratio_std", ratio_std, global_step)
+            update_dt = max(1e-6, time.time() - update_t0)
+            fps = float((num_envs * num_steps) / update_dt)
+            writer.add_scalar("perf/fps", fps, global_step)
             writer.add_scalar("rollout/reward_mean", rollout_reward_mean, global_step)
             writer.add_scalar("rollout/return_mean", rollout_return_mean, global_step)
+            writer.add_scalar("env/done_rate", done_rate, global_step)
+            writer.add_scalar("env/termination_rate", termination_rate, global_step)
+            writer.add_scalar("env/truncation_rate", truncation_rate, global_step)
+            writer.add_scalar("policy/logstd_mean", float(agent.actor_logstd.mean().item()), global_step)
+            writer.add_scalar("policy/logstd_max", float(agent.actor_logstd.max().item()), global_step)
+            writer.add_scalar("policy/logstd_min", float(agent.actor_logstd.min().item()), global_step)
+            writer.add_scalar("policy/action_abs_mean", action_abs_mean, global_step)
+            writer.add_scalar("policy/action_clip_frac", action_clip_frac, global_step)
+            if not np.isnan(explained_variance):
+                writer.add_scalar("charts/explained_variance", explained_variance, global_step)
+            writer.add_scalar("value/vpred_mean", float(b_val.mean().item()), global_step)
+            writer.add_scalar("value/return_mean", float(b_ret.mean().item()), global_step)
+            writer.add_scalar("value/return_std", float(b_ret.std().item()), global_step)
             writer.add_scalar("charts/step", global_step, global_step)
             for log_key, values in rollout_logs.items():
                 if values:
@@ -692,6 +777,11 @@ def main():
                     global_step=global_step,
                     update=update,
                 )
+                if episode_frames:
+                    frame_dir = os.path.join(
+                        "runs", run_name, "ckpt_renders", f"update_{update:05d}"
+                    )
+                    _save_frame_sequence(episode_frames, frame_dir, prefix="episode")
 
     if args.save_model and not args.eval_only:
         final_path = f"runs/{run_name}/final_ckpt.pt"
