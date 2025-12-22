@@ -177,9 +177,12 @@ class BraxAutoResetWrapper(Wrapper):
 
     state = state.replace(done=jp.zeros_like(state.done))
     state = self.env.step(state, action)
+    final_done = state.done
+    final_obs = state.obs
+    final_data = state.data
 
     def where_done(x, y):
-      done = state.done
+      done = final_done
       if done.shape and done.shape[0] != x.shape[0]:
         return y
       if done.shape:
@@ -201,8 +204,11 @@ class BraxAutoResetWrapper(Wrapper):
       if preserve_info_key in next_info:
         next_info[preserve_info_key] = state.info[preserve_info_key]
 
-    next_info[done_count_key] += state.done.astype(int)
+    next_info[done_count_key] += final_done.astype(int)
     next_info[f'{self._info_key}_rng'] = reset_rng
+    next_info['final_observation'] = final_obs
+    next_info['final_data'] = final_data
+    next_info['_final_info'] = final_done
 
     return state.replace(data=data, obs=obs, info=next_info)
 

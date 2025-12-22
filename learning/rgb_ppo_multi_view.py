@@ -499,7 +499,9 @@ def main():
     rew_buf = torch.zeros((num_steps, num_envs), device=device)
     term_buf = torch.zeros((num_steps, num_envs), device=device, dtype=torch.bool)
     trunc_buf = torch.zeros((num_steps, num_envs), device=device, dtype=torch.bool)
+    done_buf = torch.zeros((num_steps, num_envs), device=device, dtype=torch.bool)
     val_buf = torch.zeros((num_steps, num_envs), device=device)
+    final_val_buf = torch.zeros((num_steps, num_envs), device=device)
 
     next_obs = obs
     batch_size = num_steps * num_envs
@@ -552,7 +554,19 @@ def main():
                 rew_buf[step] = rew
                 term_buf[step] = term
                 trunc_buf[step] = trunc
+                done_buf[step] = done
                 next_obs = nobs
+
+                if "_final_info" in infos and "final_observation" in infos:
+                    done_mask = infos["_final_info"]
+                    if done_mask.any():
+                        final_obs = {
+                            k: v[done_mask] for k, v in infos["final_observation"].items()
+                        }
+                        with torch.no_grad():
+                            _, _, _, final_values = agent.get_action_and_value(final_obs)
+                        done_env_ids = done_mask.nonzero(as_tuple=False).view(-1)
+                        final_val_buf[step, done_env_ids] = final_values
 
                 success_values = None
                 for k, v in infos.get("log", {}).items():
@@ -641,12 +655,13 @@ def main():
                 lastgaelam = 0
                 for t in reversed(range(num_steps)):
                     if t == num_steps - 1:
-                        nextnonterminal = 1.0 - term_buf[t].float()
+                        nextnonterminal = 1.0 - done_buf[t].float()
                         nextvalues = next_value
                     else:
-                        nextnonterminal = 1.0 - term_buf[t].float()
+                        nextnonterminal = 1.0 - done_buf[t + 1].float()
                         nextvalues = val_buf[t + 1]
-                    delta = rew_buf[t] + args.gamma * nextvalues * nextnonterminal - val_buf[t]
+                    real_next_values = nextnonterminal * nextvalues + final_val_buf[t]
+                    delta = rew_buf[t] + args.gamma * real_next_values - val_buf[t]
                     lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
                     adv[t] = lastgaelam
                 ret = adv + val_buf

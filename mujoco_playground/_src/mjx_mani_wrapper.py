@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Dict, Optional, Tuple, Mapping, Sequence, List
 
 import numpy as np
@@ -294,6 +295,9 @@ class MJXManiLikeVectorEnv:
 
         return obs
 
+    def _extract_obs_from_parts(self, obs, data) -> Dict[str, torch.Tensor]:
+        return self._extract_obs(SimpleNamespace(obs=obs, data=data))
+
     # ---------- API ----------
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
         if seed is not None:
@@ -335,4 +339,12 @@ class MJXManiLikeVectorEnv:
                     infos["log"][k] = _jax_to_torch(v).float().mean().item()
                 except Exception:
                     continue
+        info = getattr(next_state, "info", None)
+        if info:
+            if "final_observation" in info and "_final_info" in info:
+                final_obs_jax = info["final_observation"]
+                final_data = info.get("final_data", None)
+                final_obs = self._extract_obs_from_parts(final_obs_jax, final_data)
+                infos["final_observation"] = final_obs
+                infos["_final_info"] = _jax_to_torch(info["_final_info"]).to(self.torch_device).to(torch.bool)
         return obs, rew, terminations, truncations, infos
