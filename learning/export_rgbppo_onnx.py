@@ -239,8 +239,8 @@ def main():
     gs_camera_id = int(train_args.get("gs_camera_id", 0))
     gs_disable_bg = bool(train_args.get("gs_disable_bg", False))
     gs_minibatch = int(train_args.get("gs_minibatch", 32))
-    gs_height = int(train_args.get("gs_height", 64))
-    gs_width = int(train_args.get("gs_width", 96))
+    gs_height = int(train_args.get("gs_height", 128))
+    gs_width = int(train_args.get("gs_width", 128))
     bg_ply = train_args.get("gs_background_ply", None)
 
     episode_length = int(episode_seconds / max(ctrl_dt, 1e-9))
