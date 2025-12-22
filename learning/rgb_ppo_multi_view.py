@@ -502,7 +502,6 @@ def main():
     val_buf = torch.zeros((num_steps, num_envs), device=device)
 
     next_obs = obs
-    next_term = torch.zeros((num_envs,), device=device, dtype=torch.bool)
     batch_size = num_steps * num_envs
     if batch_size % args.num_minibatches != 0:
         raise ValueError(
@@ -554,7 +553,6 @@ def main():
                 term_buf[step] = term
                 trunc_buf[step] = trunc
                 next_obs = nobs
-                next_term = term
 
                 success_values = None
                 for k, v in infos.get("log", {}).items():
@@ -643,10 +641,10 @@ def main():
                 lastgaelam = 0
                 for t in reversed(range(num_steps)):
                     if t == num_steps - 1:
-                        nextnonterminal = 1.0 - next_term.float()
+                        nextnonterminal = 1.0 - term_buf[t].float()
                         nextvalues = next_value
                     else:
-                        nextnonterminal = 1.0 - term_buf[t + 1].float()
+                        nextnonterminal = 1.0 - term_buf[t].float()
                         nextvalues = val_buf[t + 1]
                     delta = rew_buf[t] + args.gamma * nextvalues * nextnonterminal - val_buf[t]
                     lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
