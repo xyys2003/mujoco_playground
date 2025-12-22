@@ -214,6 +214,8 @@ def main():
     parser.add_argument("--export-on-cpu", action="store_true", help="Move model to CPU for export")
     parser.add_argument("--force-with-state", action="store_true", help="Force export (rgb,state)->action")
     parser.add_argument("--force-no-state", action="store_true", help="Force export rgb->action (must match ckpt arch)")
+    parser.add_argument("--gs-camera-ids", type=str, default=None, help="Comma-separated camera ids to override ckpt")
+    parser.add_argument("--gs-camera-names", type=str, default=None, help="Comma-separated camera names to override ckpt")
     args = parser.parse_args()
 
     use_cuda = torch.cuda.is_available() and (not args.export_on_cpu)
@@ -239,6 +241,12 @@ def main():
     gs_camera_id = int(train_args.get("gs_camera_id", 0))
     gs_camera_ids = train_args.get("gs_camera_ids", None)
     gs_camera_names = train_args.get("gs_camera_names", None)
+    if args.gs_camera_ids:
+        gs_camera_ids = [int(x) for x in args.gs_camera_ids.split(",") if x.strip()]
+        gs_camera_names = None
+    if args.gs_camera_names:
+        gs_camera_names = [x.strip() for x in args.gs_camera_names.split(",") if x.strip()]
+        gs_camera_ids = None
     gs_disable_bg = bool(train_args.get("gs_disable_bg", False))
     gs_minibatch = int(train_args.get("gs_minibatch", 32))
     gs_height = int(train_args.get("gs_height", 128))
