@@ -660,14 +660,28 @@ def main():
             b_val = val_buf.reshape(-1)
 
             # PPO diagnostics
-            y_pred = b_val.detach().cpu().numpy()
-            y_true = b_ret.detach().cpu().numpy()
-            var_y = np.var(y_true)
-            explained_variance = np.nan if var_y == 0 else float(1 - np.var(y_true - y_pred) / var_y)
+            with torch.no_grad():
+                adv_std = float(b_adv.std().item())
+                y_pred = b_val
+                y_true = b_ret
+                var_y = torch.var(y_true, unbiased=False)
+                if var_y.item() == 0:
+                    explained_variance = float("nan")
+                else:
+                    explained_variance = float(
+                        (1 - torch.var(y_true - y_pred, unbiased=False) / var_y).item()
+                    )
 
             approx_kl_vals = []
             clipfrac_vals = []
-            ratio_vals = []
+            ratio_means = []
+            ratio_vars = []
+            ratio_mins = []
+            ratio_maxs = []
+            pg_losses = []
+            v_losses = []
+            ent_losses = []
+            grad_norms = []
 
             inds = np.arange(batch_size)
             for epoch in range(args.update_epochs):
@@ -681,7 +695,10 @@ def main():
                     with torch.no_grad():
                         approx_kl_vals.append((b_logp[mb] - new_logp).mean().item())
                         clipfrac_vals.append(((ratio - 1.0).abs() > args.clip_coef).float().mean().item())
-                        ratio_vals.append(ratio.mean().item())
+                        ratio_means.append(ratio.mean().item())
+                        ratio_vars.append(ratio.var(unbiased=False).item())
+                        ratio_mins.append(ratio.min().item())
+                        ratio_maxs.append(ratio.max().item())
 
                     mb_adv = b_adv[mb]
                     mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
@@ -693,24 +710,38 @@ def main():
                     v_loss = 0.5 * (new_v - b_ret[mb]).pow(2).mean()
                     ent_loss = ent.mean()
                     loss = pg_loss + args.vf_coef * v_loss - args.ent_coef * ent_loss
+                    pg_losses.append(pg_loss.item())
+                    v_losses.append(v_loss.item())
+                    ent_losses.append(ent_loss.item())
 
                     optimizer.zero_grad()
                     loss.backward()
-                    nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                    grad_norm = nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                    grad_norms.append(float(grad_norm))
                     optimizer.step()
 
-            writer.add_scalar("loss/pg", float(pg_loss.item()), global_step)
-            writer.add_scalar("loss/v", float(v_loss.item()), global_step)
-            writer.add_scalar("loss/entropy", float(ent_loss.item()), global_step)
+            if pg_losses:
+                writer.add_scalar("loss/pg", float(np.mean(pg_losses)), global_step)
+            if v_losses:
+                writer.add_scalar("loss/v", float(np.mean(v_losses)), global_step)
+            if ent_losses:
+                writer.add_scalar("loss/entropy", float(np.mean(ent_losses)), global_step)
             if approx_kl_vals:
                 writer.add_scalar("charts/approx_kl", float(np.mean(approx_kl_vals)), global_step)
             if clipfrac_vals:
                 writer.add_scalar("charts/clipfrac", float(np.mean(clipfrac_vals)), global_step)
-            if ratio_vals:
-                ratio_mean = float(np.mean(ratio_vals))
-                ratio_std = float(np.std(ratio_vals))
+            if ratio_means:
+                ratio_mean = float(np.mean(ratio_means))
+                ratio_std = float(np.std(ratio_means))
                 writer.add_scalar("charts/ratio_mean", ratio_mean, global_step)
                 writer.add_scalar("charts/ratio_std", ratio_std, global_step)
+            if ratio_vars:
+                ratio_sample_std = float(np.sqrt(np.mean(ratio_vars)))
+                writer.add_scalar("charts/ratio_sample_std", ratio_sample_std, global_step)
+            if ratio_mins:
+                writer.add_scalar("charts/ratio_min", float(np.min(ratio_mins)), global_step)
+            if ratio_maxs:
+                writer.add_scalar("charts/ratio_max", float(np.max(ratio_maxs)), global_step)
             update_dt = max(1e-6, time.time() - update_t0)
             fps = float((num_envs * num_steps) / update_dt)
             writer.add_scalar("perf/fps", fps, global_step)
@@ -724,6 +755,9 @@ def main():
             writer.add_scalar("policy/logstd_min", float(agent.actor_logstd.min().item()), global_step)
             writer.add_scalar("policy/action_abs_mean", action_abs_mean, global_step)
             writer.add_scalar("policy/action_clip_frac", action_clip_frac, global_step)
+            writer.add_scalar("adv/std", adv_std, global_step)
+            if grad_norms:
+                writer.add_scalar("grad/global_norm", float(np.mean(grad_norms)), global_step)
             if not np.isnan(explained_variance):
                 writer.add_scalar("charts/explained_variance", explained_variance, global_step)
             writer.add_scalar("value/vpred_mean", float(b_val.mean().item()), global_step)
