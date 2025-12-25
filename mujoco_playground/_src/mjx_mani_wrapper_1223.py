@@ -329,9 +329,9 @@ class MJXManiLikeVectorEnv:
         rew = _jax_to_torch(next_state.reward).to(self.torch_device).to(torch.float32)
         done = _jax_to_torch(next_state.done).to(self.torch_device).to(torch.bool)
 
+        terminations = done
+        truncations = torch.zeros_like(done, dtype=torch.bool, device=self.torch_device)
         infos: Dict[str, Any] = {"log": {}}
-
-        # metrics -> infos["log"] (scalar means for TensorBoard)
         metrics = getattr(next_state, "metrics", None)
         if metrics:
             for k, v in metrics.items():
@@ -339,27 +339,7 @@ class MJXManiLikeVectorEnv:
                     infos["log"][k] = _jax_to_torch(v).float().mean().item()
                 except Exception:
                     continue
-
         info = getattr(next_state, "info", None)
-
-        # ---------- truncation / termination semantics ----------
-        truncations = None
-        if info:
-            for key in ("truncation", "TimeLimit.truncated", "truncated", "time_limit", "time_limit_reached"):
-                if key in info:
-                    try:
-                        truncations = _jax_to_torch(info[key]).to(self.torch_device).to(torch.bool)
-                        break
-                    except Exception:
-                        truncations = None
-                        break
-
-        if truncations is None:
-            truncations = torch.zeros_like(done, dtype=torch.bool, device=self.torch_device)
-
-        terminations = done & (~truncations)
-
-        # ---------- final_observation pass-through ----------
         if info:
             if "final_observation" in info and "_final_info" in info:
                 final_obs_jax = info["final_observation"]
@@ -367,7 +347,4 @@ class MJXManiLikeVectorEnv:
                 final_obs = self._extract_obs_from_parts(final_obs_jax, final_data)
                 infos["final_observation"] = final_obs
                 infos["_final_info"] = _jax_to_torch(info["_final_info"]).to(self.torch_device).to(torch.bool)
-
-            infos["truncation"] = truncations
-
         return obs, rew, terminations, truncations, infos

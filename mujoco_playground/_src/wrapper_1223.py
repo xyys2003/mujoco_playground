@@ -210,16 +210,6 @@ class BraxAutoResetWrapper(Wrapper):
     next_info['final_data'] = final_data
     next_info['_final_info'] = final_done
 
-    # Preserve time-limit truncation information (if provided by EpisodeWrapper/TimeLimit wrappers).
-    truncation = None
-    for k in ('truncation', 'TimeLimit.truncated', 'truncated', 'time_limit', 'time_limit_reached'):
-      if k in state.info:
-        truncation = state.info[k]
-        break
-    if truncation is None:
-      truncation = jp.zeros_like(final_done)
-    next_info['truncation'] = truncation
-
     return state.replace(data=data, obs=obs, info=next_info)
 
 

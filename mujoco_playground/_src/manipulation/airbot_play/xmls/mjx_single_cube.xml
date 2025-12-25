@@ -21,22 +21,27 @@
 
   <include file="sensor.xml"/>
 
-  <!-- <contact>
+  <contact>
     <exclude body1="left" body2="ground"/>
     <exclude body1="right" body2="ground"/>
-  </contact> -->
+  </contact>
 
   <keyframe>
     <key name="home"
       qpos="
-        0 -0.3 0.47 1.5708 -0.8 -1.5708 0 0
+        0 -0.3 0.47 1.5708 -0.8 -1.5708 0.04 0.04
         0.25 0 0.02  1 0 0 0"
       ctrl="0 -0.3 0.48 1.5708 -0.8 -1.5708 0"/>
-    <key name="pick1"
+    <!-- <key name="pick1"
       qpos="
         0 -1.1 0.683 1.5708 -1.1155 -1.5708 0.015 0.015
         0.25 0 0.02  1 0 0 0"
       ctrl="0 -1.1 0.687 1.5708 -1.1154 -1.5708 0"
+    /> -->
+    <key name="pick1"
+      qpos="0 -1.1 0.683 1.5708 -1.1155 -1.5708 0.0389484 0.0389189 
+      0.25 0 0.02  1 0 0 0"
+      ctrl="0 -1.1 0.687 1.5708 -1.1154 -1.5708 0.04"
     />
     <key name="pickup2"
       qpos="

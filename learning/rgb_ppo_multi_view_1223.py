@@ -192,8 +192,8 @@ def _default_airbot_body_map(reso: str) -> Dict[str, str]:
         "link4": (ASSETS_PATH / Reso / "link4.ply").as_posix(),
         "link5": (ASSETS_PATH / Reso / "link5.ply").as_posix(),
         "link6": (ASSETS_PATH / Reso / "link6.ply").as_posix(),
-        "left": (ASSETS_PATH / Reso / "right.ply").as_posix(),
-        "right": (ASSETS_PATH / Reso / "left.ply").as_posix(),
+        "left": (ASSETS_PATH / Reso / "left.ply").as_posix(),
+        "right": (ASSETS_PATH / Reso / "right.ply").as_posix(),
         "box": (ASSETS_PATH / "green_cube.ply").as_posix(),
     }
     return body_gaussians
@@ -527,7 +527,6 @@ def main():
             success_once_tracker = torch.zeros(num_envs, device=device, dtype=torch.bool)
 
             for step in range(num_steps):
-                final_val_buf[step].zero_()
                 global_step += num_envs
                 for k in obs_buf:
                     obs_buf[k][step] = next_obs[k]
@@ -558,15 +557,16 @@ def main():
                 done_buf[step] = done
                 next_obs = nobs
 
-                if "final_observation" in infos:
-                    # Only bootstrap for TIME-LIMIT truncations.
-                    boot_mask = trunc  # shape [num_envs], torch.bool
-                    if boot_mask.any():
-                        final_obs = {k: v[boot_mask] for k, v in infos["final_observation"].items()}
+                if "_final_info" in infos and "final_observation" in infos:
+                    done_mask = infos["_final_info"]
+                    if done_mask.any():
+                        final_obs = {
+                            k: v[done_mask] for k, v in infos["final_observation"].items()
+                        }
                         with torch.no_grad():
                             _, _, _, final_values = agent.get_action_and_value(final_obs)
-                        boot_env_ids = boot_mask.nonzero(as_tuple=False).view(-1)
-                        final_val_buf[step, boot_env_ids] = final_values
+                        done_env_ids = done_mask.nonzero(as_tuple=False).view(-1)
+                        final_val_buf[step, done_env_ids] = final_values
 
                 success_values = None
                 for k, v in infos.get("log", {}).items():
@@ -652,28 +652,18 @@ def main():
             with torch.no_grad():
                 _, _, _, next_value = agent.get_action_and_value(next_obs, action=None)
                 adv = torch.zeros_like(rew_buf, device=device)
-                lastgaelam = torch.zeros(num_envs, device=device)
-
+                lastgaelam = 0
                 for t in reversed(range(num_steps)):
                     if t == num_steps - 1:
+                        nextnonterminal = 1.0 - done_buf[t].float()
                         nextvalues = next_value
                     else:
+                        nextnonterminal = 1.0 - done_buf[t + 1].float()
                         nextvalues = val_buf[t + 1]
-
-                    # Bootstrap target:
-                    #   - non-done: V(s_{t+1})
-                    #   - truncation: V(final_observation)
-                    #   - termination: 0
-                    bootstrap = nextvalues
-                    bootstrap = torch.where(trunc_buf[t], final_val_buf[t], bootstrap)
-                    bootstrap = bootstrap * (1.0 - term_buf[t].float())
-
-                    delta = rew_buf[t] + args.gamma * bootstrap - val_buf[t]
-
-                    nonterminal = 1.0 - done_buf[t].float()
-                    lastgaelam = delta + args.gamma * args.gae_lambda * nonterminal * lastgaelam
+                    real_next_values = nextnonterminal * nextvalues + final_val_buf[t]
+                    delta = rew_buf[t] + args.gamma * real_next_values - val_buf[t]
+                    lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
                     adv[t] = lastgaelam
-
                 ret = adv + val_buf
 
             # flatten

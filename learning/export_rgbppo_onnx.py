@@ -116,8 +116,8 @@ def _default_airbot_body_map(reso: str) -> Dict[str, str]:
         "link4": (assets / r / "link4.ply").as_posix(),
         "link5": (assets / r / "link5.ply").as_posix(),
         "link6": (assets / r / "link6.ply").as_posix(),
-        "left": (assets / r / "left.ply").as_posix(),
-        "right": (assets / r / "right.ply").as_posix(),
+        "left": (assets / r / "right.ply").as_posix(),
+        "right": (assets / r / "left.ply").as_posix(),
         "box": (assets / "green_cube.ply").as_posix(),
     }
     return body

@@ -22,21 +22,14 @@ def default_config() -> config_dict.ConfigDict:
       action_repeat=1,
       action_scale=0.04,
       reward_config=config_dict.create(
-          scales=config_dict.create(
-              # Gripper goes to the box.
-              gripper_box=4.0,
-              # Box goes to the target mocap.
-              box_target=30.0,
-              close=1.0,
-              grasp=4.0,
-              lift=8.0,
-              # Do not collide the gripper with the floor.
-              no_floor_collision=0.25,
-              # Arm stays close to target pose.
-              robot_target_qpos=0.0,
-          )
-      ),
-      
+        scales=config_dict.create(
+            gripper_box=8.0,
+            box_target=40.0,
+            no_floor_collision=0.0,
+            robot_target_qpos=0.0,
+        )
+    ),
+
       impl='jax',
       nconmax=24 * 2048,
       njmax=128,
@@ -78,7 +71,6 @@ class AirbotPlayPickCube(airbot_play.AirbotPlayBase):
     self._lf_box_adr = self._mj_model.sensor_adr[self._lf_box_sensor]
     self._rf_box_adr = self._mj_model.sensor_adr[self._rf_box_sensor]
     self._gripper_act = self._mj_model.actuator("gripper").id
-
 
 
   def _post_init(self, obj_name: str, keyframe: str):
@@ -182,11 +174,10 @@ class AirbotPlayPickCube(airbot_play.AirbotPlayBase):
     **{k: jp.array(0.0, dtype=jp.float32) for k in self._config.reward_config.scales.keys()},
 }
 
-    info = {"rng": rng, "target_pos": target_pos, "reached_box": jp.array(0.0, dtype=jp.float32),    "grasped": jp.array(0.0, dtype=jp.float32)}
+    info = {"rng": rng, "target_pos": target_pos, "reached_box": 0.0,    "grasped": jp.array(0.0, dtype=jp.float32)}
     obs = self._get_obs(data, info)
     reward, done = jp.zeros(2)
     state = State(data, obs, reward, done, metrics, info)
-
     return state
 
 #   def step(self, state: State, action: jax.Array) -> State:
@@ -237,16 +228,13 @@ class AirbotPlayPickCube(airbot_play.AirbotPlayBase):
 #     return state
 
   def step(self, state: State, action: jax.Array) -> State:
-    # A) autoreset(full_reset=False) 时：data/obs 会被重置，但 info 不会。
-    #    EpisodeWrapper 会把 steps 重置为 0，所以我们用 steps==0 来清零自定义 latch。
     if "steps" in state.info:
         first = (state.info["steps"] == 0)  # shape: () or (B,)
         info0 = dict(state.info)
         info0["reached_box"] = jp.where(first, 0.0, info0["reached_box"])
         info0["grasped"] = jp.where(first, 0.0, info0["grasped"])
         state = state.replace(info=info0)
-
-    # 1) 控制
+    # 1) 控制：delta -> ctrl，并做 ctrlrange clip（这部分保持你的原逻辑即可）
     delta = action * self._action_scale
     ctrl = jp.clip(state.data.ctrl + delta, self._lowers, self._uppers)
 
@@ -254,27 +242,34 @@ class AirbotPlayPickCube(airbot_play.AirbotPlayBase):
     data = mjx_env.step(self._mjx_model, state.data, ctrl, self.n_substeps)
     data = mjx.forward(self._mjx_model, data)
 
-    # 3) reward + 关键：拿到 updated_info，并写回 state.info
-    raw_rewards, new_info = self._get_reward(data, state.info)  # <-- 改为返回二元组
+    # 3) reward（建议先算 raw_sum，再 clip；nan 检测放在 clip 前）
+    raw_rewards = self._get_reward(data, state.info)
     rewards = {k: v * self._config.reward_config.scales[k] for k, v in raw_rewards.items()}
-    raw_sum = sum(rewards.values())
-    reward = jp.clip(raw_sum, -1e4, 1e4)
 
-    # 4) 失败终止判定（batched-safe）
-    box_pos = data.xpos[self._obj_body]
+    raw_sum = sum(rewards.values())                         # 可能是标量或 (B,)
+    reward = jp.clip(raw_sum, -1e4, 1e4)                    # 这里一定要是 1e4 级别，不要写成 1e-4
+
+    # 4) 失败终止判定（按“每个 env”计算，axis=-1 保证 batched 正确）
+    box_pos = data.xpos[self._obj_body]                     # (3,) 或 (B,3)
     out_of_bounds = jp.any(jp.abs(box_pos) > 1.0, axis=-1) | (box_pos[..., 2] < 0.0)
 
-    nan_qpos = jp.any(jp.isnan(data.qpos), axis=-1)
+    nan_qpos = jp.any(jp.isnan(data.qpos), axis=-1)         # ( ) 或 (B,)
     nan_qvel = jp.any(jp.isnan(data.qvel), axis=-1)
-    nan_raw = jp.isnan(raw_sum)
+    nan_raw  = jp.isnan(raw_sum)                            # raw_sum 为 NaN 才是最关键的“源头信号”
 
     bad_state = nan_qpos | nan_qvel | nan_raw
     done_fail = out_of_bounds | bad_state
+
+    # 5) 如果你未来要加成功终止（现在没有就保持 False）
+    # done_success = (pos_err < thresh) & (rot_err < thresh2)  # shape 与 done_fail 一致
     done_success = jp.zeros_like(done_fail, dtype=jp.bool_)
+
     done = (done_fail | done_success).astype(jp.float32)
 
+    # 6) 对失败终止的 reward 做“去污染”：置 0（或一个小惩罚）
     reward = jp.where(done_fail, 0.0, reward)
 
+    # 7) metrics：把“比例类指标”写进去，后续 vector wrapper 会做 mean -> TensorBoard
     state.metrics.update(
         **raw_rewards,
         out_of_bounds=out_of_bounds.astype(jp.float32),
@@ -284,123 +279,48 @@ class AirbotPlayPickCube(airbot_play.AirbotPlayBase):
         done_fail=done_fail.astype(jp.float32),
     )
 
-    obs = self._get_obs(data, new_info)
-    return State(data, obs, reward, done, state.metrics, new_info)
+    obs = self._get_obs(data, state.info)
+    return State(data, obs, reward, done, state.metrics, state.info)
 
 
-
-  def _get_reward(self, data: mjx.Data, info: Dict[str, Any]):
+  def _get_reward(self, data: mjx.Data, info: Dict[str, Any]) -> Dict[str, Any]:
     target_pos = info["target_pos"]
     box_pos = data.xpos[self._obj_body]
     gripper_pos = data.site_xpos[self._gripper_site]
-
-    # -------------------------
-    # 1) Reach distance
-    # -------------------------
-    reach_dist = jp.linalg.norm(box_pos - gripper_pos, axis=-1)
-
-    # -------------------------
-    # 2) Two-finger contact (your contact sensors)
-    # -------------------------
-    lf_found = data.sensordata[..., self._lf_box_adr] > 0.0
-    rf_found = data.sensordata[..., self._rf_box_adr] > 0.0
-    two_finger_contact = lf_found & rf_found
-
-    # -------------------------
-    # 3) Openness / closeness from actuator ctrl
-    #    ctrlrange: 0 (closed) -> 0.04 (open)
-    # -------------------------
-    f_low = self._lowers[self._gripper_act]
-    f_high = self._uppers[self._gripper_act]
-    open01 = (data.ctrl[..., self._gripper_act] - f_low) / (f_high - f_low + 1e-6)
-    open01 = jp.clip(open01, 0.0, 1.0)   # 0=closed, 1=open
-    close01 = 1.0 - open01              # 1=closed
-
-    # near / far gates
-    near = jp.exp(-reach_dist / 0.03)                  # near≈1 when very close
-    far = 1.0 - jp.exp(-reach_dist / 0.06)             # far≈1 when far away
-
-    # -------------------------
-    # 4) Reach reward: REQUIRE opening to get reach shaping
-    #    If gripper stays closed, reach reward collapses.
-    # -------------------------
-    reach_shaping = 1.0 - jp.tanh(10.0 * reach_dist)
-    gripper_box = reach_shaping * (0.15 + 0.85 * open01)   # key change
-
-    # -------------------------
-    # 5) Close reward:
-    #    - encourage open when far (open01 * far)
-    #    - encourage close when near (close01 * near)
-    #    - penalize being closed when far (close01 * far)
-    #
-    # This directly counters "closed gripper bumping into the cube".
-    # -------------------------
-    close = (close01 * near) + (open01 * far) - 0.5 * (close01 * far)
-
-    # -------------------------
-    # 6) grasp_now: only valid if (contact) AND (sufficiently closed) AND (close enough)
-    #    add a small distance check to avoid "contact by side scraping far away".
-    # -------------------------
-    grasp_now = two_finger_contact & (close01 > 0.3) & (reach_dist < 0.02)
-
-    # latch grasped (recommended; contact can flicker during lift)
-    grasped_new = jp.maximum(info["grasped"], grasp_now.astype(jp.float32))
-    grasp = grasped_new
-
-    # -------------------------
-    # 7) lift
-    # -------------------------
-    lift_h = jp.clip(box_pos[..., 2] - self._init_obj_pos[2], 0.0, 0.12) / 0.12
-    lift = lift_h * grasp
-
-    # -------------------------
-    # 8) box_target (soft gate)
-    # -------------------------
-    pos_err = jp.linalg.norm(target_pos - box_pos, axis=-1)
-
+    pos_err = jp.linalg.norm(target_pos - box_pos)
     box_mat = data.xmat[self._obj_body]
     target_mat = math.quat_to_mat(data.mocap_quat[self._mocap_target])
-    box_6 = box_mat[..., :2, :].reshape(box_mat.shape[:-2] + (6,))
-    tgt_6 = target_mat[..., :2, :].reshape(target_mat.shape[:-2] + (6,))
-    rot_err = jp.linalg.norm(tgt_6 - box_6, axis=-1)
+    rot_err = jp.linalg.norm(target_mat.ravel()[:6] - box_mat.ravel()[:6])
 
-    box_target_raw = 1.0 - jp.tanh(5.0 * (0.9 * pos_err + 0.1 * rot_err))
-    box_target = box_target_raw * (0.1 + 0.9 * grasp)
+    box_target = 1 - jp.tanh(5 * (0.9 * pos_err + 0.1 * rot_err))
+    gripper_box = 1 - jp.tanh(5 * jp.linalg.norm(box_pos - gripper_pos))
+    robot_target_qpos = 1 - jp.tanh(
+        jp.linalg.norm(
+            data.qpos[self._robot_arm_qposadr]
+            - self._init_q[self._robot_arm_qposadr]
+        )
+    )
 
-    # -------------------------
-    # 9) floor collision
-    # -------------------------
+    # Check for collisions with the floor
     hand_floor_collision = [
-        data.sensordata[..., self._mj_model.sensor_adr[sid]] > 0
-        for sid in self._floor_hand_found_sensor
+        data.sensordata[self._mj_model.sensor_adr[sensor_id]] > 0
+        for sensor_id in self._floor_hand_found_sensor
     ]
-    floor_collision = jp.any(jp.stack(hand_floor_collision, axis=-1), axis=-1)
-    no_floor_collision = 1.0 - floor_collision.astype(jp.float32)
+    floor_collision = sum(hand_floor_collision) > 0
+    no_floor_collision = (1 - floor_collision).astype(float)
 
-    # -------------------------
-    # 10) reached_box (log/latch)
-    #     if you want to enforce "reached while open", you can latch with (open01 > 0.6)
-    # -------------------------
-    reached_box_now = (reach_dist < 0.012).astype(jp.float32)
-    reached_box_new = jp.maximum(info["reached_box"], reached_box_now)
-
-    # functional info update
-    new_info = dict(info)
-    new_info["grasped"] = grasped_new
-    new_info["reached_box"] = reached_box_new
+    info["reached_box"] = 1.0 * jp.maximum(
+        info["reached_box"],
+        (jp.linalg.norm(box_pos - gripper_pos) < 0.012),
+    )
 
     rewards = {
         "gripper_box": gripper_box,
-        "close": close,
-        "grasp": grasp,
-        "lift": lift,
-        "box_target": box_target,
+        "box_target": box_target * info["reached_box"],
         "no_floor_collision": no_floor_collision,
-        "robot_target_qpos": 0.0,  # keep as before (your scale is 0 anyway)
+        "robot_target_qpos": robot_target_qpos,
     }
-    return rewards, new_info
-
-
+    return rewards
 
   def _get_obs(self, data: mjx.Data, info: dict[str, Any]) -> jax.Array:
     gripper_pos = data.site_xpos[self._gripper_site]
